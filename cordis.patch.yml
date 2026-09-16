@@ -1,0 +1,15 @@
+# dsh-qq-bridge — bundle patch layer.
+#
+# Mounting this package into the web profile composes the QQ bridge as a
+# single host plugin (no client half). Host half connects to the QQ official
+# robot platform and drives DSH sessions in-process; configuration lives in
+# the DSH settings page under the "qq-bridge" namespace.
+#
+# Runtime activation additionally requires an insert row in the profile's
+# own cordis.patch.yml (see README §部署):
+#   - insert:
+#       - id: dsh-qq-bridge
+#         name: dsh-qq-bridge
+- insert:
+    - id: dsh-qq-bridge
+      name: dsh-qq-bridge

@@ -1,0 +1,39 @@
+{
+  "name": "dsh-qq-bridge",
+  "version": "0.7.9",
+  "type": "module",
+  "main": "lib/index.js",
+  "description": "QQ ↔ DSH 单插件桥接：QQ 机器人客户端 + 直接驱动 DSH 会话（无网关、无外部代码），设置页（QQ 桥接分区）配置凭证与启停，只回最终文本，QQ 会话 fail-closed。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "qq",
+    "bridge",
+    "remote"
+  ],
+  "license": "MIT",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web"
+    }
+  },
+  "dependencies": {}
+}

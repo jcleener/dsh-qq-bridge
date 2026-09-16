@@ -1,0 +1,20 @@
+# 依赖与产物
+node_modules/
+*.log
+*.tmp
+
+# 运行期状态（含 openid ↔ 会话映射等隐私，切勿提交）
+qq-bridge-state.json
+registry.json
+*.json.bak
+
+# 备份 / 分享包
+_backup/
+_share/
+*.zip
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
