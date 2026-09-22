@@ -1,6 +1,6 @@
 {
   "name": "dsh-qq-bridge",
-  "version": "0.16.2",
+  "version": "0.16.3",
   "type": "module",
   "main": "lib/index.js",
   "description": "QQ ↔ DSH 单插件桥接：QQ 机器人客户端 + 直接驱动 DSH 会话（无网关、无外部代码），设置页（QQ 桥接分区）配置凭证与启停，只回最终文本，QQ 会话审批经 QQ 消息 /approve /deny 决定。",
