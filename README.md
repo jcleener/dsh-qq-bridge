@@ -340,3 +340,18 @@ harness 的权限是**预设制**：一个预设 = `sandbox`（`read-only` / `wo
 | 审批 | `session.append('approval/policy')` | `approval.setPolicy(agent,'ask')` + `approval/request` 瀑布 answerer（QQ 通知，/approve /deny） |
 | 配置 | `config.json` + `manage.ps1` | DSH 设置页（appId/secret/启停） |
 | 多实例切换 | 支持（registry+HTTP） | 绑定当前实例；跨实例回 Web UI |
+
+## 兼容性
+
+- **DSH 0.1.7-rc.1：可用**（2026-09-24 实测，需两件事）。
+  1. **配置迁移**：改为 Loader 条目 `config:` + `export const Config` + `apply(ctx, config)`，设置页由
+     `host.settings.configure({ auto: true }, ctx.fiber)` 自动生成，写入经 `configEditor.edit` 落盘
+     （0.1.7 已移除 `settings.register/get`）。
+  2. **修一个迁移期引入的时序缺陷**：`readCfg` 要到 `ctx.inject` 的回调内才被接上真配置，而该回调在
+     cordis 4.0.4 下**总是异步执行**，`onSettingsApplied()` 却在 `apply` 顶层同步调用 —— 读到的是空配置
+     默认值，于是 `shouldRun` 恒为 false：**机器人从不启动**，且设置页的「启用」开关同样无效
+     （顶层读到的是上一轮 config 闭包，connKey 相同 → 提前 return）。已在 inject 回调末尾再判一次（幂等）。
+- **不要热重载**：实体位于 `profiles/web/node_modules/dsh-qq-bridge/`（刻意不做 junction 迁移）——
+  它丢弃了 `webServer.register` 的 disposer，且 `seenMsgIds` / `pendingApprovals` / `pendingQuestions` /
+  `runs` 都是模块级活状态，重载会脑裂。**改完必须重启实例。**
+- **DSH 0.1.6-alpha.2：可用**。
