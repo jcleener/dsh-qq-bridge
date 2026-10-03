@@ -1620,31 +1620,48 @@ export function apply(ctx, config) {
 		});
 	}
 	/**
-	 * dsh-session-manager 的落盘位置：桌面宿主启动参数里**没有** `--profile`，
-	 * 所以 `profile` 只是 'web' 兜底，拼出的 `profiles/web/...` 并不存在（静默失效）。
-	 * 真实位置是 DSH home 根目录；两个位置都试，取先解析到的。
-	 * @returns {{trash:Set<string>, pendingPurge:Set<string>}}
+	 * 已归档（= 已隐藏）的会话 ID。
+	 *
+	 * 契约：dsh-session-manager 的「删除」等价于「归档」——会话进回收站时一定会被打上归档
+	 * 标签，因此「未归档」就是「未删除」。归档是 DSH 核心**唯一**能把会话从各个侧边栏分组
+	 * 表面隐藏掉的机制，且由核心服务 workspaceRegistry 持有。
+	 *
+	 * 这里刻意不再读 dsh-session-manager 的私有状态文件（$DSH_HOME/dsh-session-manager.json）：
+	 * 那条路既要猜落盘位置（桌面宿主不传 --profile），又把两个插件隐式绑死。改为只依赖核心
+	 * 服务后，插件之间零耦合，且本插件的列表语义与 DSH 侧边栏保持一致。
+	 *
+	 * workspaceRegistry **不在**本插件的 inject 列表里，只能在调用时惰性取；
+	 * 若在 inject 回调里捕获，服务晚于 inject 就绪时会永久拿到 undefined。
 	 */
-	function readSessionManagerState() {
-		const candidates = [join(dshHome(), 'dsh-session-manager.json')];
-		if (profile) candidates.push(join(dshHome(), 'profiles', profile, 'dsh-session-manager.json'));
-		for (const file of candidates) {
-			try {
-				const raw = JSON.parse(readFileSync(file, 'utf8'));
-				return { trash: new Set(Object.keys(raw?.trash ?? {})), pendingPurge: new Set(Object.keys(raw?.pendingPurge ?? {})) };
-			} catch {
-				/* 换下一个候选 */
+	let archiveReadWarned = false;
+	function archivedSessionIds() {
+		try {
+			const wreg = ctx.get('workspaceRegistry') ?? svc.workspaceRegistry;
+			const st = wreg && typeof wreg.requireState === 'function' ? wreg.requireState() : undefined;
+			if (!st || !Array.isArray(st.archivedSessionIds)) {
+				// 降级必须**可观测**：静默返回空集就等于「已删会话重新出现在 QQ 里且无人知道」
+				if (!archiveReadWarned) {
+					archiveReadWarned = true;
+					log('归档集不可用（workspaceRegistry.requireState() 未就绪）：会话列表不做隐藏，已归档/已删除的会话可能重新出现');
+				}
+				return new Set();
 			}
+			return new Set(st.archivedSessionIds.map(String));
+		} catch (e) {
+			if (!archiveReadWarned) {
+				archiveReadWarned = true;
+				log(`读取归档集失败：${e?.message ?? e}；会话列表不做隐藏，已归档/已删除的会话可能重新出现`);
+			}
+			return new Set();
 		}
-		return { trash: new Set(), pendingPurge: new Set() };
 	}
 	/**
-	 * 已删除但尚未从持久化清除的会话 ID（DSH 两阶段删除：先入 trash/pendingPurge，稍后才真正 purge）。
-	 * listSessions() 走持久化层，因此这些会话仍会被返回——必须在此显式排除。
+	 * 本插件在会话列表 / 工作区列表里应当隐藏的会话（= 已归档）。
+	 * 注意：语义是「隐藏已归档」，不是「隐藏已删除」——归档而未删除的会话同样不列出，
+	 * 这正是为了与 DSH 侧边栏所见一致。
 	 */
-	function deletedSessionIds() {
-		const { trash, pendingPurge } = readSessionManagerState();
-		return new Set([...trash, ...pendingPurge]);
+	function hiddenSessionIds() {
+		return archivedSessionIds();
 	}
 	/**
 	 * 取会话列表快照。持久化查询（sessionQuery.listSessions）带超时护栏；
@@ -1764,9 +1781,9 @@ export function apply(ctx, config) {
 		let records = (snap.error ? snap.live : snap.items) ?? [];
 		// 只列主会话（与 Web 左侧一致）：排除子会话/subagent——子会话带 parentSession 或 origin==='subagent'
 		records = records.filter((r) => !r?.header?.parentSession && r?.header?.origin !== 'subagent');
-		// 排除已删除（待清除）的会话
-		const deleted = deletedSessionIds();
-		if (deleted.size) records = records.filter((r) => !deleted.has(r?.header?.id));
+		// 排除已归档的会话（含已删除的：session-manager 的删除一定会打归档标签）
+		const hidden = hiddenSessionIds();
+		if (hidden.size) records = records.filter((r) => !hidden.has(r?.header?.id));
 		const picked = [...records].sort((a, b) => (b.header?.createdAt ?? 0) - (a.header?.createdAt ?? 0)).slice(0, SESSION_LIST_CAP);
 		const titles = await sessionTitles(picked.map((r) => r.header.id));
 		const digests = await sessionDigests(picked.map((r) => r.header.id));
@@ -1837,13 +1854,13 @@ export function apply(ctx, config) {
 	/** 已知工作区（取自历史会话的 cwd，按最近使用排序；排除已删会话与目录已不存在的旧路径） */
 	async function workspaceList() {
 		const records = await svc.sessionQuery.listSessions();
-		const deleted = deletedSessionIds();
+		const hidden = hiddenSessionIds();
 		const byCwd = new Map();
 		for (const r of records) {
 			const h = r?.header;
 			const cwd = h?.cwd;
 			if (!cwd || h.parentSession || h.origin === 'subagent') continue;
-			if (deleted.has(h.id)) continue;
+			if (hidden.has(h.id)) continue;
 			let ok = false;
 			try {
 				ok = existsSync(cwd);
@@ -3069,7 +3086,7 @@ export function apply(ctx, config) {
 						ms: collected.ms,
 						records: collected.rows.length,
 						visible: collected.visible.length,
-						deletedIds: deletedSessionIds().size,
+						hiddenIds: hiddenSessionIds().size,
 						webPort: currentWebPort(),
 						perRow: collected.rows.map((row) => ({ shortId: shortIdFor(row.id), hasTitle: !!row.title, userMsgs: row.userMsgs, cwd: cwdLabel(row.cwd) })),
 					});

@@ -440,3 +440,23 @@ QQ 凭证是账号级资源：**多个 DSH 宿主进程同时加载本插件时�
 
 改代码的顺序：**先改安装目录（权威）→ 再镜像回工作区备份**；改完必须重启桌面 App 才生效
 （桌面宿主一次性读入模块，无热重载）。改前建议把旧文件备份到 `~/.dsh/plugin-backups/dsh-qq-bridge/`。
+
+## 会话列表语义与跨插件契约（2026-10-03 起）
+
+`/会话` 与「按工作区列会话」列出的都是**未归档**会话：数据来自
+`sessionQuery.listSessions()`，再减去 DSH 核心服务 `workspaceRegistry` 的
+`archivedSessionIds`。
+
+为什么必须减：**归档是 DSH 核心唯一能把会话从各个侧边栏分组表面隐藏掉的机制**，
+而 `listSessions()` 走持久化层，**已归档/已删除的会话照样会被返回**。
+
+依赖的契约：`dsh-session-manager` 的「删除」等价于「归档」——会话进回收站时一定会进
+`archivedSessionIds`（由它的 `forceArchive` 保证，启动时核对修补）。所以「未归档」=「未删除」。
+
+**历史**：本插件原先直接读 session-manager 的私有状态文件
+`$DSH_HOME/dsh-session-manager.json` 的 `trash` / `pendingPurge` 键。那条路既要猜落盘
+位置（桌面宿主不传 `--profile`），又把两个插件隐式绑死，已于 2026-10-03 移除。
+现在两个插件之间**零耦合**。
+
+**降级行为**：取不到 `workspaceRegistry` 时不做隐藏，并打印一次 `[qq-bridge]` 告警——
+不静默失败。
