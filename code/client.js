@@ -383,9 +383,70 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 
+		// Operate the official PendingApproval/PendingQuestion object, never replace its UI.
+		function startInteractiveMirror(scope) {
+			let stopped = false;
+			let busy = false;
+			const tracked = new Map();
+			const completed = new Map();
+			const source = scope.uiSession.sessionStatus;
+			const find = (entry) => {
+				const snapshot = source.getSnapshot();
+				const pending = snapshot.get(entry.sessionId)?.pendingInteraction;
+				if (!pending || pending.sessionId !== entry.sessionId) return null;
+				if (entry.kind === 'approval') return pending.kind === 'approval' && pending.toolName === entry.toolName && (!entry.callId || pending.callId === entry.callId) ? pending : null;
+				return ['question', 'plan-review'].includes(pending.kind) && JSON.stringify(pending.questions) === JSON.stringify(entry.questions) ? pending : null;
+			};
+			const ack = async (id, source, summary) => {
+				const res = await fetch('/dsh-qq-bridge/interactive/ack', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, source, summary }) });
+				if (!res.ok || !(await res.json()).ok) throw new Error('interaction ack failed');
+				tracked.delete(id); // Retain completion until Host omits ID; never replay a stale command.
+			};
+			const tick = async () => {
+				if (stopped || busy) return;
+				busy = true;
+				try {
+					const res = await fetch('/dsh-qq-bridge/interactive/pending', { cache: 'no-store' });
+					if (!res.ok) return;
+					const body = await res.json();
+					if (!body.ok || stopped) return;
+					const commands = new Map((body.commands || []).map((c) => [c.id, c]));
+					const live = new Set();
+					for (const entry of body.pending || []) {
+						live.add(entry.id);
+						if (completed.has(entry.id)) { const done = completed.get(entry.id); await ack(entry.id, done.source, done.summary); continue; }
+						const pending = find(entry);
+						if (!pending) {
+							if (tracked.has(entry.id)) { completed.set(entry.id, { source: 'desktop', summary: '官方卡片已处理或请求已结束' }); await ack(entry.id, 'desktop', '官方卡片已处理或请求已结束'); }
+							continue;
+						}
+						const previous = tracked.get(entry.id);
+						if (previous && previous !== pending.key) { completed.set(entry.id, { source: 'desktop', summary: '原始卡片已结束' }); await ack(entry.id, 'desktop', '原始卡片已结束'); continue; }
+						tracked.set(entry.id, pending.key);
+						const command = commands.get(entry.id);
+						if (!command || pending.answerable === false) continue;
+						// No await between this final snapshot check and invoking answer: desktop wins safely.
+						if (find(entry) !== pending) continue;
+						await pending.answer(command.answer);
+						const summary = typeof command.answer === 'string' ? command.answer : JSON.stringify(command.answer);
+						completed.set(entry.id, { source: 'qq', summary });
+						await ack(entry.id, 'qq', summary);
+					}
+					for (const id of new Set([...tracked.keys(), ...completed.keys()])) if (!live.has(id)) { tracked.delete(id); completed.delete(id); }
+				} catch (error) { console.warn('[qq-bridge] interaction mirror:', error); }
+				finally { busy = false; }
+			};
+			const timer = setInterval(tick, 750);
+			const unsubscribe = source.subscribe(() => { void tick(); });
+			void tick();
+			scope.on('dispose', () => { stopped = true; clearInterval(timer); unsubscribe(); tracked.clear(); completed.clear(); });
+			return tick;
+		}
+
 		//#region plugin
 		const inject = ["slots"];
 		function apply(ctx) {
+			ctx.inject(["uiSession"], startInteractiveMirror);
 			ctx.inject(["slots"], (scope) => {
 				scope.slots.inject("settings.section", () => scope.slots.register({
 					name: "settings.section",
@@ -396,6 +457,7 @@ window.__ModuleLoader__.load({
 			});
 		}
 		//#endregion
+		exports.startInteractiveMirror = startInteractiveMirror;
 		exports.apply = apply;
 		exports.inject = inject;
 		return module.exports;

@@ -1,10 +1,11 @@
 /** * dsh-qq-bridge — host half of the QQ bridge, single-plugin edition. * * One DSH plugin that is BOTH the QQ bot client and the DSH driver: *   - connects to the QQ official robot platform (WSS long connection) and *     handles C2C direct messages, with reconnect backoff and heartbeat; *   - drives DSH sessions in-process via current-version services *     (sessionController / sessionQuery / sessions / approval) — no gateway, *     no HTTP bridge, no registry-dependent routing; *   - configured from the DSH settings page ("qq-bridge" namespace): *     appId / appSecret / sandbox / enabled toggle / chat timeout / steer / *     notifyOnComplete（会话状态推送）/ 消息推送内容（pushTodo / pushDeliverable / *     pushToolCall / pushNarration 四个勾选项）. *     QQ 回复排版（msg_type=2 markdown）内置生效，没有开关：失败自动降级纯文本。 *     新建会话的工作目录不在设置里：兜底新建走 DSH 默认（实例进程目录），要指定项目用 /new 选工作区。 * * Only the final assistant text is sent back to QQ: reasoning / tool-call / * tool-result are separate content-block types and are filtered out, so the * user never sees thinking or tool traces. * * 会话状态推送（notifyOnComplete）：任何主会话一轮正常结束时给 QQ 推「[会话名]已完成」； * 等你选择 / 等你审批也推；QQ 用户当前正接入的那个会话不推，子会话不推。 * * * QQ-driven sessions run with approval policy 'ask', bridged to QQ: the pending approval is delivered as a QQ message and the user answers /approve or /deny; timeout auto-rejects. Web-UI sessions are unaffected. * * Requirements: DSH current version (0.1.5-rc.1 service layer), Node >= 22 * (global fetch / WebSocket). Zero npm dependencies — only node builtins and * @deepseek-ai/schemastery (ships with DSH) for the settings schema. */
 import { randomUUID, createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, rmSync } from 'node:fs';
 import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { homedir } from 'node:os';
 import z from '@deepseek-ai/schemastery';
+import { qqText } from './messages.js';
 export const name = 'dsh-qq-bridge';
 
 // ── settings schema (renders as a form on the DSH settings page) ───────────
@@ -24,7 +25,7 @@ const SCHEMA = z.object({
 });
 const QQ_INTENTS = 1 << 25; // C2C_MESSAGE_CREATE + GROUP_AT_MESSAGE_CREATE
 const SESSION_LIST_CAP = 30; // /会话 最多展示条数（按创建时间倒序）
-const BOT = { running: false, connected: false, retry: 0, ws: null, heartbeat: null, retryTimer: null, lastSeq: null, msgSeq: 0, chains: new Map(), sockets: new Set() };
+const BOT = { running: false, connected: false, retry: 0, ws: null, heartbeat: null, retryTimer: null, lastSeq: null, msgSeq: 0, chains: new Map(), sockets: new Set(), lastAckAt: 0, lastFrameAt: 0 };
 /** 已处理的 QQ 消息 id：QQ 事件可能重复投递（重连重发等），同一 id 只处理一次。 */
 const seenMsgIds = new Set();
 const apiBase = (cfg) => (cfg.sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sgroup.qq.com');
@@ -49,7 +50,7 @@ let log = (...a) => console.log(`[qq-bridge] ${a.join(' ')}`);
 // ── state: short-ID map + per-openid current session ───────────────────────
 const stateFile = () => join(dshHome(), 'bridge', 'qq-bridge-state.json');
 const SHORT_BASE = 1000; // 4 位短 ID 起点；state.next 自增并落盘 → 跨重启固定
-const freshState = () => ({ next: SHORT_BASE, map: {}, openids: {}, permPreset: {} });
+const freshState = () => ({ next: SHORT_BASE, map: {}, openids: {}, permPreset: {}, interactive: { pending: [], commands: [], recent: [] } });
 let state = freshState();
 void loadState(); // 模块加载即恢复落盘的 state（openids/短ID 映射）；失败则保持 fresh
 async function loadState() {
@@ -59,6 +60,10 @@ async function loadState() {
 	} catch {
 		state = freshState();
 	}
+	// 审批/问答对象由当前 Host 和当前浏览器持有；冷启动无法恢复原始
+	// PendingApproval/PendingQuestion。保留最近结果，丢弃旧进程遗留的待答/命令。
+	const recent = Array.isArray(state.interactive?.recent) ? state.interactive.recent.slice(0, 50) : [];
+	state.interactive = { pending: [], commands: [], recent };
 	migrateShortIds();
 }
 /** 短 ID 迁移/计数修正：旧 6 位 ID 按原顺序重编为 4 位自增；next 恒大于 map 最大值。有变更才落盘。 */
@@ -107,27 +112,6 @@ async function saveLastInbound() {
 	} catch {
 		/* best-effort */
 	}}
-// ── 定时任务落盘（qq-schedule.json）────────────────────────────────────────
-const scheduleFile = () => join(dshHome(), 'bridge', 'qq-schedule.json');
-let schedule = { tasks: [] };
-void loadSchedule(); // 与 state 同样：模块加载即恢复
-async function loadSchedule() {
-	try {
-		const raw = JSON.parse(await readFile(scheduleFile(), 'utf8'));
-		schedule = { tasks: Array.isArray(raw?.tasks) ? raw.tasks.filter((t) => t && typeof t === 'object' && t.id && t.at) : [] };
-	} catch {
-		schedule = { tasks: [] };
-	}}
-async function saveSchedule() {
-	try {
-		const dir = join(dshHome(), 'bridge');
-		await mkdir(dir, { recursive: true });
-		const file = scheduleFile();
-		await writeFile(file + '.tmp', JSON.stringify(schedule, null, 2), 'utf8');
-		await rename(file + '.tmp', file);
-	} catch {
-		/* best-effort */
-	}}
 function perUser(openid) {
 	if (!state.openids[openid]) state.openids[openid] = { sessionId: null };
 	return state.openids[openid];}
@@ -162,6 +146,48 @@ function displayShort(sessionId) {
 
 // ── registry (仅用于 /profile 展示实例；单插件模式不依赖它路由) ─────────────
 const registryPath = () => join(dshHome(), 'bridge', 'registry.json');
+/** 进程是否还活着（EPERM 说明进程存在但无权限 → 也算活着）。 */
+function pidAlive(pid) {
+	const n = Number(pid);
+	if (!Number.isFinite(n) || n <= 0) return false;
+	try {
+		process.kill(n, 0);
+		return true;
+	} catch (e) {
+		return e?.code === 'EPERM';
+	}
+}
+// ── QQ 桥接独占锁：多个 DSH 实例共用一份凭证时，只允许一个实例连 QQ ────────
+// 否则每个实例各持一条长连接，同一条私聊消息会被回复 N 次（本机实测 3 次）。
+const lockPath = () => join(dshHome(), 'bridge', 'qq-bridge.lock.json');
+function claimQqOwnership() {
+	try {
+		const raw = JSON.parse(readFileSync(lockPath(), 'utf8'));
+		const owner = Number(raw?.pid);
+		if (Number.isFinite(owner) && owner !== process.pid && pidAlive(owner)) return { ok: false, owner };
+	} catch {
+		/* 没有锁或锁损坏 → 视为可抢占 */
+	}
+	try {
+		mkdirSync(join(dshHome(), 'bridge'), { recursive: true });
+		writeFileSync(lockPath(), JSON.stringify({ pid: process.pid, startedAt: Date.now() }, null, 2), 'utf8');
+	} catch (e) {
+		log(`QQ 独占锁写入失败: ${e?.message ?? e}`);
+	}
+	return { ok: true };
+}
+function releaseQqOwnership() {
+	try {
+		const raw = JSON.parse(readFileSync(lockPath(), 'utf8'));
+		if (Number(raw?.pid) === process.pid) rmSync(lockPath(), { force: true });
+	} catch {
+		/* ignore */
+	}}
+/** 当前存活实例（按 pid 过滤）：/状态 的多实例诊断依据。 */
+async function liveInstances() {
+	const all = await readRegistry();
+	return Object.entries(all).filter(([pid]) => pidAlive(pid));
+}
 function registerInstance(entry) {
 	try {
 		mkdirSync(join(dshHome(), 'bridge'), { recursive: true });
@@ -170,6 +196,11 @@ function registerInstance(entry) {
 			data = JSON.parse(readFileSync(registryPath(), 'utf8'));
 		} catch {
 			/* first write */
+		}
+		// 清掉已死进程的陈旧记录：桌面 App 退出时宿主可能被强杀，dispose 不会执行，
+		// 旧记录会一直累积（本机曾积到 8 条），使 /profile 与重复实例诊断失真。
+		for (const pid of Object.keys(data.instances ?? {})) {
+			if (!pidAlive(pid)) delete data.instances[pid];
 		}
 		data.updatedAt = Date.now();
 		data.instances[String(process.pid)] = entry;
@@ -328,7 +359,7 @@ function narrationLine(event) {
 		.replace(/\s+/g, ' ')
 		.trim();
 	if (!text) return null;
-	return `💬 ${text}`;}
+	return qqText('P01', { body: text });}
 /** 路径 → 末三段（`D:\a\b\c\d.js` → `b/c/d.js`），QQ 上一行读得下又能认出是哪个包。 */
 function shortPath(p) {
 	const parts = String(p ?? '').split(/[\\/]/).filter(Boolean);
@@ -349,91 +380,6 @@ function permissionPresetNames(service) {
 	if (service.autoAdmit !== undefined) names.push('auto');
 	return names;}
 
-// ── 定时推送（qq_schedule）：纯逻辑放模块级，便于测试 ─────────────────────
-const SCHED_MAX_TASKS = 50;
-const SCHED_MIN_MINUTES = 1; // 一次性任务最早 1 分钟后
-const SCHED_MIN_EVERY = 5; // 循环间隔下限（分钟），防刷主动消息频次
-/** "HH:MM" → 当天的分钟数；非法返回 null。 */
-function parseHHMM(s) {
-	const m = /^(\d{1,2}):(\d{2})$/.exec(String(s ?? '').trim());
-	if (!m) return null;
-	const h = Number(m[1]);
-	const min = Number(m[2]);
-	if (!Number.isInteger(h) || !Number.isInteger(min) || h > 23 || min > 59) return null;
-	return h * 60 + min;}
-/**
- * 下一次触发时刻（epoch ms）：`hhmm` 本地时间 + repeat（once/daily/weekdays）。
- * from 当天该时刻已过则顺延（once 也顺延到明天）；weekdays 跳过周六周日。
- */
-function nextAtTime(hhmm, repeat, fromMs) {
-	const mins = parseHHMM(hhmm);
-	if (mins === null) return null;
-	const d = new Date(fromMs);
-	const target = new Date(d.getFullYear(), d.getMonth(), d.getDate(), Math.floor(mins / 60), mins % 60, 0, 0);
-	if (target.getTime() <= fromMs) target.setDate(target.getDate() + 1);
-	if (repeat === 'weekdays') {
-		while (target.getDay() === 0 || target.getDay() === 6) target.setDate(target.getDate() + 1);
-	}
-	return target.getTime();}
-/** 任务展示成一行：`🕒 a1b2 每天 08:00（下次 09-23 08:00）→ ⏰ 喝水`。 */
-function scheduleLine(task, nowMs) {
-	const when = task.inMinutes ? `一次 +${task.inMinutes}min` : task.repeat === 'weekdays' ? `工作日 ${task.atTime}` : task.repeat === 'once' ? `一次 ${task.atTime}` : `每天 ${task.atTime}`;
-	const d = new Date(task.at ?? nowMs);
-	const pad = (n) => String(n).padStart(2, '0');
-	const next = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-	const what = task.prompt ? `🤖 ${oneLine(task.prompt, 40)}` : `⏰ ${oneLine(task.text, 40)}`;
-	const where = task.prompt ? (task.mode === 'new' ? '🆕无头会话' : '📍当前会话') : '';
-	return `🕒 ${task.id} ${when}（下次 ${next}）${where ? `[${where}] ` : ''}→ ${what}`;}
-/**
- * 校验并构造一条定时任务（纯函数，便于测试）。
- * @returns { ok: true, task } | { ok: false, error }
- */
-function buildScheduleTask(args, nowMs, sid, openid) {
-	const a = args ?? {};
-	const text = String(a.text ?? '').trim();
-	const prompt = String(a.prompt ?? '').trim();
-	if (!text && !prompt) return { ok: false, error: '要给出 text（固定文本）或 prompt（到点让 agent 干活）' };
-	if (text && prompt) return { ok: false, error: 'text 和 prompt 只能给一个' };
-	if (text.length > 2000) return { ok: false, error: 'text 超过 2000 字' };
-	const inMinutes = Number(a.inMinutes);
-	const hasIn = Number.isFinite(inMinutes) && inMinutes > 0;
-	const atTime = a.atTime === undefined ? null : String(a.atTime);
-	if (hasIn && atTime) return { ok: false, error: 'inMinutes 和 atTime 只能给一个' };
-	if (!hasIn && !atTime) return { ok: false, error: '要给出 inMinutes（N 分钟后）或 atTime（"HH:MM"）' };
-	let repeat = String(a.repeat ?? (hasIn ? 'once' : 'daily'));
-	if (!['once', 'daily', 'weekdays'].includes(repeat)) return { ok: false, error: `repeat 只能是 once/daily/weekdays（收到 ${repeat}）` };
-	let at;
-	if (hasIn) {
-		if (inMinutes < SCHED_MIN_MINUTES) return { ok: false, error: `inMinutes 至少 ${SCHED_MIN_MINUTES}` };
-		at = nowMs + Math.round(inMinutes) * 60000;
-		repeat = 'once';
-	} else {
-		at = nextAtTime(atTime, repeat, nowMs);
-		if (at === null) return { ok: false, error: `atTime 需要 "HH:MM" 格式（收到 ${atTime}）` };
-	}
-	if (!sid) return { ok: false, error: '拿不到当前会话 ID，无法定时' };
-	// 执行落点：prompt 任务默认走「一次性无头会话」（落在创建任务的工作区，与对话会话解耦）；
-	// session:'current' 才回到创建它的会话里跑（需要那边上下文时用）。
-	const mode = prompt ? (String(a.session ?? 'new') === 'current' ? 'current' : 'new') : 'current';
-	const id = Math.random().toString(36).slice(2, 6);
-	return {
-		ok: true,
-		task: {
-			id,
-			at,
-			repeat,
-			inMinutes: hasIn ? Math.round(inMinutes) : null,
-			atTime: hasIn ? null : atTime,
-			text: text || null,
-			prompt: prompt || null,
-			mode,
-			cwd: mode === 'new' ? (a.cwd ? String(a.cwd) : null) : null,
-			sessionId: sid,
-			openid: openid ?? null,
-			createdAt: nowMs,
-			lastFiredAt: null,
-		},
-	};}
 /**
  * 「消息推送内容」勾选项是否打开：`pushTodo` / `pushDeliverable` / `pushToolCall` / `pushNarration`。
  * 未显式设置时按「推」处理（与设置页默认勾选一致）；显式 false 才不推。
@@ -458,24 +404,24 @@ function todoLine(todos) {
 	const done = todos.filter((t) => t?.status === 'completed').length;
 	const cur = todos.find((t) => t?.status === 'in_progress');
 	const curText = oneLine(cur?.content, 50);
-	const lines = [`📋 待办 ${done}/${todos.length}${curText ? ` · 正在做：${curText}` : ''}`];
+	const lines = [qqText('P02', { done, total: todos.length, ...(curText ? { current: curText } : {}) })];
 	const MAX = 15;
 	todos.slice(0, MAX).forEach((t, i) => {
 		const mark = t?.status === 'completed' ? '✅' : t?.status === 'in_progress' ? '▶' : '⬜';
-		lines.push(`${mark} ${i + 1}. ${oneLine(t?.content, 50)}`);
+		lines.push(qqText('P03', { mark, index: i + 1, content: oneLine(t?.content, 50) }));
 	});
-	if (todos.length > MAX) lines.push(`…（其余 ${todos.length - MAX} 项略）`);
+	if (todos.length > MAX) lines.push(qqText('P04', { count: todos.length - MAX }));
 	return lines.join('\n');}
 /** `deliverables/presented` → 📎 一条交付清单：文件名（末两段）+ 说明。 */
 function deliverableLine(files) {
 	if (!Array.isArray(files) || files.length === 0) return null;
-	const lines = [`📎 交付 ${files.length} 个文件`];
+	const lines = [qqText('P05', { count: files.length })];
 	const MAX = 12;
 	files.slice(0, MAX).forEach((f) => {
 		const desc = oneLine(f?.description, 40);
-		lines.push(`· ${shortPath(f?.path)}${desc ? ` — ${desc}` : ''}`);
+		lines.push(qqText('P05a', { path: shortPath(f?.path), ...(desc ? { description: desc } : {}) }));
 	});
-	if (files.length > MAX) lines.push(`…（其余 ${files.length - MAX} 个略）`);
+	if (files.length > MAX) lines.push(qqText('P06', { count: files.length - MAX }));
 	return lines.join('\n');}
 
 // ── QQ 富媒体（发文件）──────────────────────────────────────────────────────
@@ -607,6 +553,52 @@ function sendWs(obj) {
 	} catch (e) {
 		log(`WS send 失败: ${e?.message ?? e}`);
 	}}
+/** 看门狗：超过这个倍数的心跳间隔都没收到任何帧（尤其 op11 ACK）→ 判定连接假活 */
+const WS_SILENCE_FACTOR = 2.5;
+/**
+ * 长连接看门狗。
+ *
+ * 为什么需要：WebSocket 半开（Mac 睡眠/NAT 超时/代理断开）时 onclose/onerror **不会触发**，
+ * BOT.connected 会一直停在 true —— 设置页看起来"已连接"，但 QQ 的消息再也收不到，
+ * 只有主动发消息（走 HTTP）还成功。这类故障以前只能靠人肉重启实例解决。
+ * 现在：按心跳间隔巡检，连续 2.5 个间隔没有任何帧/ACK 就强制关闭当前 socket，
+ * 交给 onclose → scheduleReconnect 重连。
+ */
+let wsWatchdog = null;
+let wsWatchdogTick = null; // 供测试直接驱动一次巡检（不依赖真实定时器）
+function stopWsWatchdog() {
+	if (wsWatchdog) {
+		clearInterval(wsWatchdog);
+		wsWatchdog = null;
+	}
+	wsWatchdogTick = null;}
+function startWsWatchdog(heartbeatMs) {
+	stopWsWatchdog();
+	const hi = Number.isFinite(heartbeatMs) && heartbeatMs > 0 ? heartbeatMs : 45000;
+	const silenceLimit = Math.max(30000, Math.round(hi * WS_SILENCE_FACTOR));
+	const tick = () => {
+		if (!BOT.running || !BOT.connected || !BOT.ws) return;
+		const last = Math.max(BOT.lastFrameAt, BOT.lastAckAt);
+		const silence = Date.now() - last;
+		if (silence <= silenceLimit) return;
+		log(`WS 静默 ${Math.round(silence / 1000)}s（> ${Math.round(silenceLimit / 1000)}s）→ 判定连接假活，强制重连`);
+		BOT.connected = false;
+		const dead = BOT.ws;
+		BOT.ws = null;
+		try {
+			dead?.close();
+		} catch {
+			/* ignore */
+		}
+		// close 事件若也没触发（极端半开），兜底排一次重连
+		setTimeout(() => {
+			if (BOT.running && !BOT.connected && !BOT.ws) scheduleReconnect();
+		}, 2000).unref?.();
+	};
+	wsWatchdogTick = tick;
+	wsWatchdog = setInterval(tick, Math.max(5000, Math.round(hi / 2)));
+	wsWatchdog.unref?.();
+}
 function scheduleReconnect() {
 	if (!BOT.running) return;
 	if (BOT.retryTimer) clearTimeout(BOT.retryTimer);
@@ -622,12 +614,16 @@ function handleWsFrame(data) {
 	} catch {
 		return;
 	}
+	BOT.lastFrameAt = Date.now();
 	const op = msg.op;
 	if (op === 10) {
 		// Hello → Identify + 心跳
 		const hi = Number(msg.d?.heartbeat_interval);
 		BOT.connected = true;
 		BOT.retry = 0;
+		BOT.lastFrameAt = Date.now();
+		BOT.lastAckAt = Date.now();
+		startWsWatchdog(hi);
 		if (BOT.heartbeat) clearInterval(BOT.heartbeat);
 		sendWs({ op: 2, d: { token: `QQBot ${BOT.token}`, intents: QQ_INTENTS, shard: [0, 1] } });
 		if (hi > 0) {
@@ -637,7 +633,7 @@ function handleWsFrame(data) {
 		log('WS READY（已 Identify，开始接收消息）');
 		return;
 	}
-	if (op === 11) return; // Heartbeat ACK
+	if (op === 11) { BOT.lastAckAt = Date.now(); return; } // Heartbeat ACK：刷新看门狗
 	if (op === 1) {
 		sendWs({ op: 1, d: BOT.lastSeq ?? null });
 		return;
@@ -663,6 +659,7 @@ function handleWsFrame(data) {
 let handleUserText = null; // (openid, msgId, text) => Promise<void> 由 apply 注入
 let answerPendingByText = null; // (openid, text) => boolean 由 apply 注入（普通消息 → 自由回答）
 let handleNewPick = null; // (openid, text) => boolean 由 apply 注入（/new 选工作区：纯数字回复）
+let handleModelPick = null; // (openid, text) => boolean 由 apply 注入（/模型两阶段选择）
 let onGroupAt = (d) => {
 	const gid = d?.group_openid;
 	if (gid) {
@@ -692,11 +689,15 @@ function onC2CMessage(d) {
 	}
 	// 指令（/开头）立即处理：/approve /deny /答 /状态 等不能被正在进行的对话阻塞。
 	if (content.startsWith('/')) {
-		handleUserText(openid, msgId, content).catch(() => {});
+		handleUserText(openid, msgId, content).catch((e) => log(`指令 ${content.split(/\s+/, 1)[0]} 处理失败: ${e?.stack ?? e}`));
 		return;
 	}
 	// 有待回答的问题时，普通消息直接作为自由回答（立即处理，不排队）
 	if (answerPendingByText && (pendingQuestions[openid]?.length ?? 0) > 0 && answerPendingByText(openid, content)) {
+		return;
+	}
+	// /模型 两阶段选择：纯数字回复优先交给模型选择流程
+	if (handleModelPick && handleModelPick(openid, content)) {
 		return;
 	}
 	// /new 待选工作区：纯数字回复 → 在该工作区新建会话并接入
@@ -784,6 +785,7 @@ async function connectLoop() {
 			clearTimeout(handshakeTimer);
 			if (BOT.ws !== socket) return; // 非当前 socket：不重置状态、不重连
 			BOT.connected = false;
+			stopWsWatchdog();
 			if (BOT.heartbeat) {
 				clearInterval(BOT.heartbeat);
 				BOT.heartbeat = null;
@@ -851,10 +853,10 @@ function completionNoticeFor(session, event, cfg) {
  * 该会话完成时，哪些 QQ 用户要收到通知：所有已知 openid，**除了**当前正接入这个会话的那个
  * （它那一轮的正文已经由回复观察器直接回给 QQ，再推一条「已完成」就是重复）。
  */
-function noticeTargets(state, sid) {
+function noticeTargets(state, sid, includeDisconnected = false) {
 	const out = [];
 	for (const [openid, per] of Object.entries(state?.openids ?? {})) {
-		if (per?.sessionId === sid) continue;
+		if ((!includeDisconnected && per?.disconnected) || per?.sessionId === sid) continue;
 		out.push(openid);
 	}
 	return out;
@@ -878,7 +880,7 @@ export function apply(ctx, config) {
 			console.log(line);
 		}
 	};
-	const svc = { settings: null, sessionController: null, sessionQuery: null, sessions: null, approval: null, agentPresets: null };
+	const svc = { settings: null, sessionController: null, sessionQuery: null, sessions: null, approval: null, agentPresets: null, schedule: null };
 	const webPort = (() => {
 		const p = Number(argvValue('--port'));
 		return Number.isFinite(p) ? p : null;
@@ -932,7 +934,7 @@ export function apply(ctx, config) {
 		if (event?.type !== 'tool/call') return;
 		let a = String(event.data?.arguments ?? '');
 		if (a.length > 120) a = a.slice(0, 120) + '…';
-		const line = `🔧 ${event.data?.name ?? '?'}${a ? ` ${a}` : ''}`;
+		const line = qqText('P07', { name: event.data?.name ?? '?', ...(a ? { preview: a } : {}) });
 		recordTool(sid, line); // 始终记录：供超时/中断时打包回放（旁白/清单不进这份工具清单）
 		if (RICH_TOOLS.has(String(event.data?.name ?? ''))) return; // 📋/📎 已经说清楚了
 		if (pushEnabled(cfg, 'pushToolCall')) {
@@ -1132,23 +1134,18 @@ export function apply(ctx, config) {
 	 * 超时/中断时把本轮全部工具调用打包附上——只给最后一条文本看不到工作全貌。
 	 */
 	function formatTurn(result, digest) {
-		if (result.error) return `❌ ${result.error}`;
+		if (result.error) return qqText('R03', { error: result.error });
 		if (result.aborted || result.timedOut) {
 			const head = result.aborted
-				? '⏹️ 已停止当前工作。'
-				: `⚠️ 处理超时（>${Math.round((readCfg().chatTimeoutMs || 300000) / 60000)} 分钟）\n本轮可能仍在运行，完成后会自动补发正文。`;
+				? qqText('R04')
+				: qqText('R05', { minutes: Math.round((readCfg().chatTimeoutMs || 300000) / 60000) });
 			const lines = [head];
 			const list = digest ?? [];
-			if (list.length) {
-				const MAX = 30;
-				lines.push('', `本轮已执行的工具调用（共 ${list.length} 步）：`);
-				for (let i = 0; i < Math.min(list.length, MAX); i++) lines.push(`  ${i + 1}、${list[i]}`);
-				if (list.length > MAX) lines.push(`  …（其余 ${list.length - MAX} 步略）`);
-			}
-			lines.push('', '已完成的部分输出：', result.text || '（无产出）');
+			if (list.length) lines.push('', qqText('R06', { steps: list }));
+			lines.push('', qqText('R07', { body: result.text }));
 			return lines.join('\n');
 		}
-		return result.text || '（空回复）';
+		return result.text || qqText('R02');
 	}
 	/** DSH 是否已在 afterTurn 之后开了新的一轮（被合并/排队的消息会紧接着开轮） */
 	async function waitTurnStart(sessionId, afterTurn, ms) {
@@ -1169,16 +1166,18 @@ export function apply(ctx, config) {
 			existing.openid = openid;
 			return;
 		}
-		const state = { openid, inTurn: false, stopTyping: startTyping(openid) };
+		if (perUser(openid).disconnected) return;
+		const state = { openid, detached: false, inTurn: false, stopTyping: startTyping(openid) };
 		runs.set(sessionId, state);
 		(async () => {
 			try {
 				let base = beforeTurn;
 				let warned = false; // 已发过超时提示：连续两次超时才真退出（长工具/慢收尾可能超过单个窗口）
-				while (true) {
+				while (!state.detached && !perUser(state.openid).disconnected) {
 					state.inTurn = true;
 					const waiter = waitForTurn(sessionId, base, readCfg().chatTimeoutMs || 300000, null);
 					const result = await waiter.promise;
+					if (state.detached || perUser(state.openid).disconnected) break;
 					state.inTurn = false;
 					base = result.endedTurn ?? base;
 					if (result.timedOut && warned) break; // 连续两次超时：本轮确实无进展，退出观察
@@ -1187,7 +1186,11 @@ export function apply(ctx, config) {
 					const digest = takeToolDigest(sessionId);
 					await sendText(state.openid, formatTurn(result, digest));
 					if (result.timedOut) continue; // 已提示超时：继续守同一轮（或其后排队的轮），正文到达即补发
-					if (!(await waitTurnStart(sessionId, base, 1200))) break;
+					if (!(await waitTurnStart(sessionId, base, 1200))) {
+						// 官方 schedule 刚往这个会话投递了提醒：它的轮次马上开始，继续守
+						if (state.followupPending) { state.followupPending = false; continue; }
+						break;
+					}
 				}
 			} catch (e) {
 				log(`回复观察器异常: ${e?.message ?? e}`);
@@ -1229,7 +1232,36 @@ export function apply(ctx, config) {
 	 * 后者覆盖"无头定时会话"（没人绑定它，但它是替某个 QQ 用户跑的）。
 	 */
 	function ownerOpenidForSession(sid) {
-		return openidForSession(sid) ?? runs.get(sid)?.openid ?? null;
+		const owner = openidForSession(sid) ?? runs.get(sid)?.openid ?? null;
+		return owner && !perUser(owner).disconnected ? owner : null;
+	}
+	/**
+	 * 记住这个 QQ 用户用过的会话（最新在前，最多 50 个）。
+	 * 官方 schedule 把任务绑在**会话**上，用户 /会话 切走之后还要能 /提醒 看到并取消自己的任务，
+	 * 所以归属不能只看"当前绑定"。
+	 */
+	function rememberSession(openid, sid) {
+		if (!openid || !sid) return;
+		const per = perUser(openid);
+		const list = Array.isArray(per.sessions) ? per.sessions : (per.sessions = []);
+		const i = list.indexOf(sid);
+		if (i === 0) return;
+		if (i > 0) list.splice(i, 1);
+		list.unshift(sid);
+		if (list.length > 50) list.length = 50;
+		void saveState();
+	}
+	/**
+	 * 该把会话结果发给谁：绑定 → 本轮 run → 用过的会话记录（仅当唯一候选时）。
+	 * 与 ownerOpenidForSession 的区别是最后那层，让切走会话后的计划任务结果仍能回到 QQ。
+	 */
+	function sessionOwner(sid) {
+		const direct = ownerOpenidForSession(sid);
+		if (direct) return direct;
+		const candidates = Object.entries(state.openids)
+			.filter(([, per]) => per && !per.disconnected && Array.isArray(per.sessions) && per.sessions.includes(sid))
+			.map(([openid]) => openid);
+		return candidates.length === 1 ? candidates[0] : null;
 	}
 	/** 本轮工具调用记录（sessionId -> 行数组）：超时/中断时打包回放「工作全貌」 */
 	const toolLog = new Map();
@@ -1276,6 +1308,8 @@ export function apply(ctx, config) {
 	const DELIVER_FILE_MAX = 5; // 一次最多发几个，防刷屏/防额度
 	/** 把一批本机文件发到 QQ（分片上传 → 富媒体消息）；返回逐条结果供工具回报。 */
 	async function sendFilesToQq(openid, files) {
+		if (perUser(openid).disconnected) throw new Error("QQ 已断开会话，禁止文件推送");
+		const epoch = perUser(openid).routingEpoch ?? 0;
 		const list = (Array.isArray(files) ? files : []).slice(0, DELIVER_FILE_MAX);
 		const results = [];
 		for (const f of list) {
@@ -1294,6 +1328,7 @@ export function apply(ctx, config) {
 				const c = readCfg();
 				const token = await ensureToken(c.appId, c.appSecret);
 				const { fileInfo, fileType } = await uploadQqFile(apiBase(c), token, openid, { name: basename(p), buf: readFileSync(p) });
+				if (perUser(openid).disconnected || (perUser(openid).routingEpoch ?? 0) !== epoch) break;
 				await sendQqMedia(apiBase(c), token, openid, fileInfo);
 				log(`文件已发到 QQ：${basename(p)}（${st.size} B, file_type=${fileType}）`);
 				results.push(`✓ ${basename(p)}（${(st.size / 1024).toFixed(1)}KB）`);
@@ -1317,7 +1352,7 @@ export function apply(ctx, config) {
 			const parent = s.header?.parentSession;
 			s = parent ? (svc.sessions?.get?.(parent) ?? null) : null;
 		}
-		const known = Object.keys(state.openids ?? {});
+		const known = Object.keys(state.openids ?? {}).filter(o => !perUser(o).disconnected);
 		if (known.length === 1) return { openid: known[0], how: '唯一已知 QQ 用户（本会话未接入 QQ）' };
 		throw new Error(
 			known.length === 0 ? '还没有任何 QQ 用户和机器人说过话，无法推送' : '本会话未接入 QQ，且有多个已知用户，无法确定收件人',
@@ -1384,149 +1419,11 @@ export function apply(ctx, config) {
 					return { ok: okCount > 0, message: `发往 QQ（${target.how}）：\n${results.join('\n')}` };
 				},
 			}));
-			toolCtx.tools.register(defineTool({
-				name: 'qq_schedule',
-				description: 'Schedule a QQ push through the bridge: either a fixed reminder text, or a prompt that the agent runs at that time (its answer goes back to QQ). Use action=create to add, action=list to show pending tasks, action=cancel with an id to remove one. One-shot: inMinutes. Recurring: atTime "HH:MM" (+ repeat daily|weekdays|once, default daily). Tasks persist across restarts; a task missed while the instance was down is fired once on startup.',
-				parameters: {
-					action: { type: 'string', required: true, description: "create | list | cancel" },
-					text: { type: 'string', description: 'Fixed reminder text (create; give either text or prompt).' },
-					prompt: { type: 'string', description: 'Prompt the agent runs at that time; its final answer is pushed to QQ (create; give either text or prompt).' },
-					inMinutes: { type: 'integer', description: 'Fire once after N minutes (create; alternative to atTime).' },
-					atTime: { type: 'string', description: 'Local "HH:MM" for recurring tasks (create; alternative to inMinutes).' },
-					repeat: { type: 'string', description: 'once | daily | weekdays (create with atTime; default daily).' },
-					session: { type: 'string', description: "Where a prompt runs: 'new' (default) = a fresh headless session created in this session's workspace; 'current' = run inside this session." },
-					id: { type: 'string', description: 'Task id to cancel (action=cancel; see action=list).' },
-				},
-				output: {
-					schema: {
-						type: 'object',
-						additionalProperties: false,
-						properties: {
-							ok: { type: 'boolean', required: true },
-							message: { type: 'string', required: true },
-						},
-					},
-					render: (_args, value) => [{ type: 'text', text: value.message }],
-				},
-				async execute(args, exec) {
-					if (!BOT.running) throw new Error('QQ 桥接未启用：请到设置页打开「启用桥接」');
-					const action = String(args?.action ?? '').trim();
-					const now = Date.now();
-					if (action === 'list') {
-						if (schedule.tasks.length === 0) return { ok: true, message: '当前没有定时任务' };
-						const lines = [...schedule.tasks].sort((a, b) => a.at - b.at).map((t) => scheduleLine(t, now));
-						return { ok: true, message: `${schedule.tasks.length} 个定时任务：\n${lines.join('\n')}` };
-					}
-					if (action === 'cancel') {
-						const id = String(args?.id ?? '').trim();
-						const before = schedule.tasks.length;
-						schedule.tasks = schedule.tasks.filter((t) => t.id !== id);
-						if (schedule.tasks.length === before) throw new Error(`没有 id=${id} 的定时任务（用 action=list 看现有任务）`);
-						await saveSchedule();
-						log(`定时任务 ${id} 已取消`);
-						return { ok: true, message: `已取消定时任务 ${id}` };
-					}
-					if (action !== 'create') throw new Error(`action 只能是 create/list/cancel（收到 ${action || '空'}）`);
-					if (schedule.tasks.length >= SCHED_MAX_TASKS) throw new Error(`定时任务上限 ${SCHED_MAX_TASKS} 个，先取消一些`);
-					const session = exec?.agent?.session;
-					const sid = session?.header?.id ?? session?.id ?? null;
-					let openid = null;
-					try {
-						openid = qqSendTarget(session).openid;
-					} catch {
-						/* 只在 create 时不必非要收件人：到点再解析 */
-					}
-					const built = buildScheduleTask({ ...args, cwd: session?.header?.cwd }, now, sid, openid);
-					if (!built.ok) throw new Error(built.error);
-					schedule.tasks.push(built.task);
-					await saveSchedule();
-					log(`新定时任务 ${built.task.id}（${scheduleLine(built.task, now)}）`);
-					return { ok: true, message: `已排定：${scheduleLine(built.task, now)}` };
-				},
-			}));
 		}).catch((e) => {
-			log(`注册 qq_send / qq_schedule 工具失败（只是少工具，桥接不受影响）: ${e?.message ?? e}`);
+			log(`注册 qq_send 工具失败（只是少工具，桥接不受影响）: ${e?.message ?? e}`);
 		});
 	});
-	// ── 定时推送调度器：qq_schedule 工具 + /提醒 命令 ─────────────────────────
-	// 任务落盘（qq-schedule.json），每 20s 扫一次；实例当时没开 → 启动后补发一次
-	// （一次性任务超过 24h 就丢弃，避免开机刷出一堆过期提醒）。
-	const SCHED_CATCHUP_MAX_MS = 24 * 60 * 60 * 1000;
-	const SCHED_TICK_MS = 20000;
-	let schedBusy = false;
-	/** 收件人：任务指定 → 会话接入的用户 → 唯一已知用户。 */
-	function schedTarget(task) {
-		if (task.openid) return task.openid;
-		return qqSendTarget(svc.sessions?.get?.(task.sessionId) ?? { header: { id: task.sessionId } });
-	}
-	/** 到点干活：先报一句"定时任务"，再按 text 发固定文本 / 按 prompt 让 agent 生成后回 QQ。 */
-	async function fireTask(task, catchUp) {
-		const openid = schedTarget(task);
-		const tag = catchUp ? '⏰ 补发定时任务' : '⏰ 定时任务';
-		try {
-			if (task.text) {
-				await sendText(openid, `${tag}：${task.text}`);
-			} else {
-				// 执行落点：无头会话（每次新建，落在创建任务的工作区并归组）或创建它的会话
-				let sid = task.sessionId;
-				if (task.mode === 'new') {
-					const created = await svc.sessionController.create(task.cwd ? { cwd: task.cwd } : {});
-					sid = created?.sessionId ?? created?.id;
-					if (!sid) throw new Error('无头会话创建失败（未返回 sessionId）');
-					if (task.cwd) await attachToWorkspace(sid, task.cwd);
-					log(`定时任务 ${task.id} 起无头会话 ${displayShort(sid)}（${task.cwd ?? 'DSH 默认目录'}）`);
-				}
-				const before = await currentTurn(sid);
-				await sendText(openid, `${tag}：${oneLine(task.prompt, 60)}`);
-				await submitPrompt(sid, task.prompt);
-				ensureReplier(openid, sid, before); // 结果由回复观察器发回 QQ
-			}
-			log(`定时任务 ${task.id} 已触发（${catchUp ? '补发' : '准点'}，${task.text ? '文本' : task.mode === 'new' ? '无头会话' : '当前会话'}）`);
-		} catch (e) {
-			log(`定时任务 ${task.id} 触发失败: ${e?.message ?? e}`);
-			try {
-				await sendText(openid, `⚠️ 定时任务 ${task.id} 触发失败：${e?.message ?? e}`);
-			} catch {
-				/* ignore */
-			}
-		}
-	}
-	/** 扫描并执行到期任务；catchUp=true 时把「已过期但≤24h」的也补发一次。 */
-	async function schedulerTick(catchUp) {
-		if (schedBusy) return;
-		schedBusy = true;
-		try {
-			const now = Date.now();
-			let changed = false;
-			for (const task of [...schedule.tasks]) {
-				if (!task?.at || task.at > now) continue;
-				const overdue = now - task.at;
-				const shouldFire = catchUp ? overdue <= SCHED_CATCHUP_MAX_MS : true;
-				// 先排下一次（循环任务）或摘掉（一次性），再执行 —— 触发过程中崩了也不会重复刷
-				if (task.repeat === 'once') {
-					schedule.tasks = schedule.tasks.filter((t) => t.id !== task.id);
-				} else {
-					const next = nextAtTime(task.atTime, task.repeat, now);
-					task.at = next ?? now + 24 * 3600 * 1000;
-				}
-				task.lastFiredAt = now;
-				changed = true;
-				await saveSchedule();
-				if (shouldFire) await fireTask(task, catchUp && overdue > SCHED_TICK_MS * 2);
-				else log(`定时任务 ${task.id} 过期 ${Math.round(overdue / 60000)} 分钟（>24h），丢弃`);
-			}
-			if (changed) await saveSchedule();
-		} finally {
-			schedBusy = false;
-		}
-	}
-	ctx.effect(() => {
-		void loadSchedule().then(() => schedulerTick(true)); // 启动时补发
-		const timer = setInterval(() => void schedulerTick(false), SCHED_TICK_MS);
-		timer.unref?.();
-		return () => clearInterval(timer);
-	}, 'qq-bridge: scheduler');
-	// ── 通路标记：每条用户消息都记下"来自哪条通路"，供模型判断该用哪条路交付 ────
+		// ── 通路标记：每条用户消息都记下"来自哪条通路"，供模型判断该用哪条路交付 ────
 	ctx.on('session/event', (session, event) => {
 		if (event?.type !== 'user/message') return;
 		const src = event.data?.source ?? {};
@@ -1541,6 +1438,76 @@ export function apply(ctx, config) {
 			text: text.slice(0, 40),
 		};
 		void saveLastInbound();
+	});
+	// ── 官方 schedule 到点投递 → QQ ───────────────────────────────────────────
+	// schedule 插件把提醒作为 user/message 投进**原会话** inbox（source.kind==='schedule'），
+	// 由该会话自己跑一轮，若该会话属于某个 QQ 用户就把这一轮结果发回 QQ。
+	//
+	// ⚠️ 不能用「当前轮次号」当观察基线：实测事件顺序是
+	//     turn/start(turn=N) → step/start → user/message(source=schedule)
+	// （投递消息是在这一轮内部才落事件的），此时快照里已经有 N，
+	// 观察器只等 `turn > N` 就会永远等不到自己这一轮，正文发不出去（只到 5 分钟超时）。
+	// 所以改为「登记 sid → 该轮 turn/end 时取正文发送」，完全不依赖轮次号比较。
+	const scheduleDeliveries = new Map(); // sessionId -> { openid }
+	ctx.on('session/event', (session, event) => {
+		if (event?.type !== 'user/message') return;
+		if (event.data?.source?.kind !== 'schedule') return;
+		const sid = session?.id ?? session?.header?.id;
+		if (!sid) return;
+		const openid = sessionOwner(sid);
+		if (!openid) return;
+		const existing = runs.get(sid);
+		if (existing) {
+			existing.followupPending = true; // 正在聊这个会话：由现有观察器负责这一轮
+			return;
+		}
+		if (!scheduleDeliveries.has(sid)) {
+			scheduleDeliveries.set(sid, { openid });
+			log(`计划任务提醒已投递到会话 ${displayShort(sid)}，结果将回 QQ`);
+		}
+	});
+	/**
+	 * 每一轮结束 → 把这一轮正文回 QQ。
+	 *
+	 * 归属规则与「旁白/工具推送」完全一致：**只要这个会话属于某个 QQ 用户，这一轮就该回 QQ**，
+	 * 不区分这轮是从 QQ 还是从桌面端发起的。之前只在「QQ 发起的轮次」里挂回复观察器，
+	 * 于是桌面端发起（同一个 QQ 绑定会话）的轮次只有旁白/工具行推到 QQ、正文留在桌面 —— 就是用户看到的现象。
+	 *
+	 * QQ 发起的轮次仍由回复观察器负责（打字状态、超时补发、工具回放都在它那边），
+	 * 这里只在没有观察器时兜底，避免重复发送。
+	 */
+	ctx.on('session/event', (session, event) => {
+		if (event?.type !== 'turn/end') return;
+		const sid = session?.id ?? session?.header?.id;
+		if (!sid) return;
+		const delivered = scheduleDeliveries.delete(sid);
+		const replier = runs.get(sid);
+		if (replier) {
+			// 观察器已在守这一轮（QQ 发起的轮次，或投递时它就在）→ 交给它，避免重复
+			if (replier.followupPending) replier.followupPending = false;
+			return;
+		}
+		// 收件人与「旁白/工具行」同源：普通轮次只看当前绑定（openidForSession）；
+		// 计划任务投递那一轮允许回退到「用过的会话」（sessionOwner），
+		// 否则用户把绑定切走后就收不到自己任务的结果了。
+		const openid = delivered ? sessionOwner(sid) : openidForSession(sid);
+		if (!openid) return;
+		if (perUser(openid).disconnected) return;
+		const turn = event.data?.turn;
+		let events = [];
+		try {
+			events = session?.snapshotEvents?.() ?? [];
+		} catch {
+			/* 快照读不到就按空正文处理 */
+		}
+		const assistantEvents = events.filter((e) => e?.type === 'assistant/message'
+			&& (typeof turn !== 'number' || e?.data?.turn === turn));
+		const reason = event.data?.reason ?? null;
+		const error = reason?.kind === 'error' ? (reason.error?.message ?? 'agent turn error') : null;
+		const aborted = reason?.kind === 'aborted' || reason?.kind === 'interrupted';
+		const text = formatTurn({ text: extractFinalText(assistantEvents), error, timedOut: false, aborted }, []);
+		void sendText(openid, text).catch(() => {});
+		log(`会话 ${displayShort(sid)} 第 ${turn ?? '?'} 轮正文已回 QQ（无观察器：桌面端或计划任务发起，${text.length} 字）`);
 	});
 	// ── 会话状态推送：完成 / 等你选择 / 等你审批 → QQ ─────────────────────────
 	// 开关：设置页「QQ接受会话完成状态」(notifyOnComplete)；QQ 正在聊的那个会话不推
@@ -1558,7 +1525,7 @@ export function apply(ctx, config) {
 		}
 		if (event?.type !== 'turn/end') return; // 高频事件（消息/工具）直接返回，不查设置
 		const sid = completionNoticeFor(session, event, readCfg());
-		if (sid) queueSessionNotice(session, sid, async () => `[${await sessionLabel(session, sid)}]已完成`);
+		if (sid) queueSessionNotice(session, sid, async () => qqText('N01', { sessionName: await sessionLabel(session, sid) }), true);
 	});
 	/** 会话名：session/title 缓存 → 标题快照 → 工作区名 → 短 ID。 */
 	async function sessionLabel(session, sid) {
@@ -1576,25 +1543,25 @@ export function apply(ctx, config) {
 			/* 取不到标题就退到兜底名 */
 		}
 		const cwd = session?.header?.cwd;
-		return cwd ? `工作区 ${cwdLabel(cwd)}` : `会话 ${displayShort(sid)}`;
+		return qqText('N04', { shortId: displayShort(sid), ...(cwd ? { workspace: cwdLabel(cwd) } : {}) });
 	}
 	/**
 	 * 「这个会话在等你输入」推送入口（选择题 / 审批都走这里）。
 	 * tail 例：`在等你选择：要跑哪个方案？`、`需要审批：Bash`。
 	 */
-	function notifyWaiting(session, tail) {
+	function notifyWaiting(session, buildLine) {
 		const sid = noticeSidFor(session, readCfg());
 		if (!sid) return;
-		queueSessionNotice(session, sid, async () => `[${await sessionLabel(session, sid)}]${tail}`);
+		queueSessionNotice(session, sid, async () => buildLine(await sessionLabel(session, sid)));
 	}
 	/** 串行推送状态通知（一条 QQ 消息一个人一次；避免并发触发频控）。 */
-	function queueSessionNotice(session, sid, buildLine) {
+	function queueSessionNotice(session, sid, buildLine, includeDisconnected = false) {
 		if (!BOT.running) return;
 		if (noticeQueue.length >= NOTICE_BACKLOG_MAX) {
 			log(`状态通知积压超过 ${NOTICE_BACKLOG_MAX} 条，丢弃：${sid}`);
 			return;
 		}
-		noticeQueue.push({ session, sid, buildLine });
+		noticeQueue.push({ session, sid, buildLine, includeDisconnected });
 		if (noticeBusy) return;
 		noticeBusy = true;
 		(async () => {
@@ -1602,12 +1569,12 @@ export function apply(ctx, config) {
 				while (noticeQueue.length) {
 					const item = noticeQueue.shift();
 					try {
-						const targets = noticeTargets(state, item.sid);
+						const targets = noticeTargets(state, item.sid, item.includeDisconnected);
 						if (!targets.length) continue; // 唯一用户在聊这个会话 → 无需通知
 						const line = await item.buildLine(item.session, item.sid);
 						for (const openid of targets) {
 							try {
-								await sendText(openid, line);
+								await sendText(openid, line, null, { completionNotice: item.includeDisconnected });
 							} catch (e) {
 								log(`状态通知发送失败（${String(openid).slice(0, 8)}…）: ${e?.message ?? e}`);
 							}
@@ -1624,127 +1591,249 @@ export function apply(ctx, config) {
 	}
 	// ── 命令 ──────────────────────────────────────────────────────────────
 	async function cmdProfile() {
-		const insts = await readRegistry();
+		// 只报存活实例：桌面 App 被强杀时宿主可能变孤儿，其 registry 条目不会被回收
+		const insts = Object.fromEntries(await liveInstances());
 		const keys = Object.keys(insts);
-		if (!keys.length) return '当前没有检测到运行中的 DSH 实例（registry 为空）。';
-		const lines = ['📡 运行中的 DSH 实例：', ''];
-		keys
+		if (!keys.length) return qqText('C01');
+		const instances = keys
 			.sort((a, b) => (insts[a]?.webPort ?? 0) - (insts[b]?.webPort ?? 0))
-			.forEach((pid, idx) => {
+			.map((pid, idx) => {
 				const e = insts[pid] || {};
-				const cur = String(e.webPort) === String(webPort) ? '  ←当前' : '';
-				lines.push(`${idx + 1}、web:${e.webPort ?? '?'}  bridge:${e.bridgePort ?? '?'}  pid:${pid}${cur}`);
-				lines.push(`   启动: ${fmtTime(e.startedAt)}   cwd: ${e.cwd ?? '?'}`);
+				return { index: idx + 1, webPort: e.webPort ?? '?', bridgePort: e.bridgePort ?? '?', pid,
+					current: String(e.webPort) === String(webPort), startedAt: fmtTime(e.startedAt), cwd: e.cwd ?? '?' };
 			});
-		lines.push('', `本插件已绑定当前实例（web:${webPort}）。跨实例对话请在 Web UI 操作。`);
-		return lines.join('\n');
+		return qqText('C02', { instances, webPort });
+	}
+	/**
+	 * 会话查询整体超时（listSessions / readTitleSnapshots / 逐条正文）。
+	 * 单插件的命令回复必须**永不静默挂死**：超时就降级到内存里的 live sessions。
+	 */
+	const SESSION_QUERY_TIMEOUT_MS = 7000;
+	/** 给一个 promise 加超时护栏；超时只 reject 本函数，不取消底层（sessionQuery 不接受 signal 的子集）。 */
+	function withTimeout(promise, ms, label) {
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error(`${label} 超时（>${ms}ms）`)), ms);
+			Promise.resolve(promise).then(
+				(v) => { clearTimeout(timer); resolve(v); },
+				(e) => { clearTimeout(timer); reject(e); },
+			);
+		});
+	}
+	/**
+	 * dsh-session-manager 的落盘位置：桌面宿主启动参数里**没有** `--profile`，
+	 * 所以 `profile` 只是 'web' 兜底，拼出的 `profiles/web/...` 并不存在（静默失效）。
+	 * 真实位置是 DSH home 根目录；两个位置都试，取先解析到的。
+	 * @returns {{trash:Set<string>, pendingPurge:Set<string>}}
+	 */
+	function readSessionManagerState() {
+		const candidates = [join(dshHome(), 'dsh-session-manager.json')];
+		if (profile) candidates.push(join(dshHome(), 'profiles', profile, 'dsh-session-manager.json'));
+		for (const file of candidates) {
+			try {
+				const raw = JSON.parse(readFileSync(file, 'utf8'));
+				return { trash: new Set(Object.keys(raw?.trash ?? {})), pendingPurge: new Set(Object.keys(raw?.pendingPurge ?? {})) };
+			} catch {
+				/* 换下一个候选 */
+			}
+		}
+		return { trash: new Set(), pendingPurge: new Set() };
 	}
 	/**
 	 * 已删除但尚未从持久化清除的会话 ID（DSH 两阶段删除：先入 trash/pendingPurge，稍后才真正 purge）。
 	 * listSessions() 走持久化层，因此这些会话仍会被返回——必须在此显式排除。
 	 */
 	function deletedSessionIds() {
-		try {
-			const file = join(dshHome(), 'profiles', profile, 'dsh-session-manager.json');
-			const raw = JSON.parse(readFileSync(file, 'utf8'));
-			return new Set([...Object.keys(raw?.trash ?? {}), ...Object.keys(raw?.pendingPurge ?? {})]);
-		} catch {
-			return new Set();
-		}
+		const { trash, pendingPurge } = readSessionManagerState();
+		return new Set([...trash, ...pendingPurge]);
 	}
-	async function cmdSessions(openid) {
-		let records;
-		try {
-			records = await svc.sessionQuery.listSessions();
-		} catch (e) {
-			return `❌ 拿不到会话列表：${e?.message ?? e}`;
+	/**
+	 * 取会话列表快照。持久化查询（sessionQuery.listSessions）带超时护栏；
+	 * 超时/异常时退回内存里的 live sessions，绝不让 /会话 静默挂死。
+	 * @returns {Promise<{items?: Array<{header:object}>, source?: string, error?: string, live: Array<{header:object}>}>}
+	 */
+	async function sessionSnapshot() {
+		let queried = null;
+		let queryError = null;
+		if (svc.sessionQuery?.listSessions) {
+			try {
+				const list = await withTimeout(svc.sessionQuery.listSessions(), SESSION_QUERY_TIMEOUT_MS, 'listSessions');
+				if (Array.isArray(list)) queried = list;
+				else queryError = 'listSessions 返回了非数组';
+			} catch (e) {
+				queryError = e?.message ?? String(e);
+			}
+		} else {
+			queryError = 'sessionQuery 服务不可用';
 		}
+		const live = (svc.sessions?.list?.() ?? []).filter((s) => s?.header).map((s) => ({ header: s.header, live: true }));
+		if (queried === null) return { error: queryError, live };
+		const merged = new Map();
+		for (const r of queried) if (r?.header?.id) merged.set(r.header.id, r);
+		let added = 0;
+		for (const r of live) if (!merged.has(r.header.id)) { merged.set(r.header.id, r); added += 1; }
+		return { items: [...merged.values()], source: added ? 'sessionQuery+live' : 'sessionQuery', live };
+	}
+	/**
+	 * 批量取标题。形状与内核 readTitleSnapshots 一致（projectMany → {status, value:{session,title}}）；
+	 * 内核若在未来改形状，这里整体退回"无标题"而不是让 /会话 报错。
+	 * @returns {Promise<Map<string,string>>} sessionId → 标题
+	 */
+	async function sessionTitles(ids) {
+		const map = new Map();
+		if (!ids.length || !svc.sessionQuery?.readTitleSnapshots) return map;
+		try {
+			const trs = await withTimeout(svc.sessionQuery.readTitleSnapshots(ids), SESSION_QUERY_TIMEOUT_MS, 'readTitleSnapshots');
+			for (const tr of trs ?? []) {
+				const t = tr?.status === 'fulfilled' ? (tr.value?.title?.title ?? tr.value?.title) : null;
+				if (tr?.sessionId && typeof t === 'string' && t) map.set(tr.sessionId, t);
+			}
+		} catch {
+			/* 标题失败不影响列表 */
+		}
+		return map;
+	}
+	/**
+	 * 逐条摘要（轮数 / 最近活跃 / 预览）。优先一次 projectMany 批量投影（与内核标题投影同一套路，
+	 * 复用内核的消息投影，避免手写 foldSurface），批量失败则退回逐条 readSession。
+	 * @param {string[]} ids - 会话 ID（已裁剪）
+	 * @returns {Promise<Map<string,{userMsgs:number,lastActive:number|null,preview:string|null}>>}
+	 */
+	async function sessionDigests(ids) {
+		const map = new Map();
+		/** 从一个会话的事件数组里折叠出摘要。 */
+		const digestOf = (events) => {
+			let userMsgs = 0;
+			let lastActive = null;
+			let lastUserPreview = null;
+			let lastAssistantPreview = null;
+			for (const e of events ?? []) {
+				if (e?.type === 'user/message') {
+					userMsgs += 1;
+					lastUserPreview = textOfEvent(e) ?? lastUserPreview;
+				} else if (e?.type === 'assistant/message') {
+					lastAssistantPreview = textOfEvent(e) ?? lastAssistantPreview;
+				}
+				if (typeof e?.time === 'number') lastActive = e.time;
+			}
+			return { userMsgs, lastActive, preview: lastUserPreview ?? lastAssistantPreview };
+		};
+		if (!ids.length || !svc.sessionQuery) return map;
+		if (typeof svc.sessionQuery.projectMany === 'function') {
+			try {
+				const results = await withTimeout(
+					svc.sessionQuery.projectMany(ids, (source) => digestOf(source.events)),
+					SESSION_QUERY_TIMEOUT_MS,
+					'projectMany',
+				);
+				for (const r of results ?? []) {
+					if (r?.status === 'fulfilled' && r.value) map.set(r.sessionId, r.value);
+				}
+				if (map.size === ids.length) return map;
+			} catch {
+				/* 批量失败 → 退回逐条 */
+			}
+		}
+		if (typeof svc.sessionQuery.readSession === 'function') {
+			await Promise.all(ids.map(async (id) => {
+				if (map.has(id)) return;
+				try {
+					const loaded = await withTimeout(svc.sessionQuery.readSession(id), SESSION_QUERY_TIMEOUT_MS, 'readSession');
+					const events = Array.isArray(loaded) ? loaded : (loaded?.events ?? []);
+					map.set(id, digestOf(events));
+				} catch {
+					/* 单条失败跳过 */
+				}
+			}));
+		}
+		return map;
+	}
+	/** 当前 Web 端口：优先跑在宿主里的 webServer.port（启动参数可能不带 --port）。 */
+	function currentWebPort() {
+		return svc.webServer?.port ?? webPort ?? '?';
+	}
+	/**
+	 * 采集 /会话 需要的会话行（也供诊断出口复用）。
+	 * @returns {Promise<{rows: object[], visible: object[], source: string|null, error: string|null, ms: number}>}
+	 */
+	async function collectSessionRows() {
+		const startedAt = Date.now();
+		const snap = await sessionSnapshot();
+		if (snap.error && !snap.live.length) {
+			return { rows: [], visible: [], source: null, error: snap.error, ms: Date.now() - startedAt };
+		}
+		let records = (snap.error ? snap.live : snap.items) ?? [];
 		// 只列主会话（与 Web 左侧一致）：排除子会话/subagent——子会话带 parentSession 或 origin==='subagent'
 		records = records.filter((r) => !r?.header?.parentSession && r?.header?.origin !== 'subagent');
 		// 排除已删除（待清除）的会话
 		const deleted = deletedSessionIds();
 		if (deleted.size) records = records.filter((r) => !deleted.has(r?.header?.id));
 		const picked = [...records].sort((a, b) => (b.header?.createdAt ?? 0) - (a.header?.createdAt ?? 0)).slice(0, SESSION_LIST_CAP);
-		// 标题（批量）+ 轮数/预览（readSurface）
-		let titles = new Map();
-		try {
-			const trs = await svc.sessionQuery.readTitleSnapshots(picked.map((r) => r.header.id));
-			for (const tr of trs) {
-				if (tr?.status === 'fulfilled' && tr.value?.title) titles.set(tr.sessionId, tr.value.title.title);
-			}
-		} catch {
-			/* 标题失败不影响列表 */
-		}
-		const rows = await Promise.all(
-			picked.map(async (r) => {
-				const h = r.header;
-				let userMsgs = 0;
-				let lastActive = null;
-				let lastUserPreview = null;
-				let lastAssistantPreview = null;
-				try {
-					const surf = await svc.sessionQuery.readSurface(h.id);
-					const ue = surf.events.filter((e) => e.type === 'user/message');
-					const ae = surf.events.filter((e) => e.type === 'assistant/message');
-					userMsgs = ue.length;
-					lastUserPreview = textOfEvent(ue.at(-1));
-					lastAssistantPreview = textOfEvent(ae.at(-1));
-					const lastEv = surf.events.at(-1);
-					if (lastEv && typeof lastEv.time === 'number') lastActive = lastEv.time;
-				} catch {
-					/* 单条失败跳过 */
-				}
-				return {
-					id: h.id,
-					cwd: h.cwd ?? null,
-					agentPreset: h.agentPreset ?? null,
-					createdAt: h.createdAt ?? null,
-					title: titles.get(h.id) ?? null,
-					userMsgs,
-					lastActive,
-					lastUserPreview,
-					lastAssistantPreview,
-				};
-			}),
-		);
+		const titles = await sessionTitles(picked.map((r) => r.header.id));
+		const digests = await sessionDigests(picked.map((r) => r.header.id));
+		const rows = picked.map((r) => {
+			const h = r.header;
+			const d = digests.get(h.id) ?? { userMsgs: 0, lastActive: null, preview: null };
+			return {
+				id: h.id,
+				cwd: h.cwd ?? null,
+				agentPreset: h.agentPreset ?? null,
+				createdAt: h.createdAt ?? null,
+				title: titles.get(h.id) ?? null,
+				userMsgs: d.userMsgs,
+				lastActive: d.lastActive,
+				lastUserPreview: d.preview,
+				lastAssistantPreview: d.preview,
+			};
+		});
 		// 按最近活跃排序（显示时间同步为最近活跃）：正在用的会话排前面
 		rows.sort((a, b) => (b.lastActive ?? b.createdAt ?? 0) - (a.lastActive ?? a.createdAt ?? 0));
 		// 空壳会话（无标题且无任何用户消息）不展示
 		const visible = rows.filter((r) => r.title || r.userMsgs > 0);
-		if (!visible.length) return '该实例上没有持久化的会话（可能所有会话都还在运行的 agent 内存中）。';
+		return { rows, visible, source: snap.error ? 'live（持久化查询失败）' : snap.source, error: snap.error ?? null, ms: Date.now() - startedAt };
+	}
+	async function cmdSessions(openid) {
+		let collected;
+		try {
+			collected = await collectSessionRows();
+		} catch (e) {
+			return qqText('C03', { error: e?.message ?? e });
+		}
+		if (collected.error && !collected.visible.length) return qqText('C03', { error: collected.error });
+		const visible = collected.visible;
+		if (!visible.length) return qqText('C04');
 		const groups = new Map();
 		for (const s of visible) {
 			const key = s.cwd ?? '(未指定)';
 			if (!groups.has(key)) groups.set(key, []);
 			groups.get(key).push(s);
 		}
-		const lines = [`💬 会话列表（web:${webPort}，按工作区）：`, ''];
-		for (const [cwd, sesses] of groups) {
-			lines.push(`工作区[${cwdLabel(cwd)}]`);
-			sesses.forEach((s) => {
-				const short = shortIdFor(s.id);
+		const groupRows = [...groups].map(([cwd, sesses]) => ({
+			workspace: cwdLabel(cwd),
+			sessions: sesses.map((s) => {
 				const title = s.title || s.lastUserPreview || s.lastAssistantPreview || s.id.slice(8, 20);
-				const cur = perUser(openid).sessionId === s.id ? '  ←当前' : '';
-				lines.push(`[${short}] ${String(title).slice(0, 26)}${cur}`);
-				lines.push(`     ${fmtTime(s.lastActive ?? s.createdAt)} · ${s.userMsgs}问 · ${s.agentPreset ?? 'standard'}`);
-			});
-			lines.push('');
-		}
+				return { shortId: shortIdFor(s.id), title: String(title).slice(0, 26),
+					current: perUser(openid).sessionId === s.id,
+					time: fmtTime(s.lastActive ?? s.createdAt), userMsgs: s.userMsgs, preset: s.agentPreset ?? 'standard' };
+			}),
+		}));
 		saveState();
-		lines.push('用 /会话 <4位ID> 接入对应会话（ID 固定，跨重启不变）；不带 ID 发消息将新建会话。');
-		return lines.join('\n');
+		return qqText('C05', { webPort: currentWebPort(), groups: groupRows });
 	}
 	function cmdAttach(openid, arg) {
 		const short = String(arg || '').trim();
 		const sid = state.map[short];
-		if (!sid) return `找不到会话 [${short}]。用 /会话 查看列表。`;
+		if (!sid) return qqText('C06a', { shortId: short });
 		perUser(openid).sessionId = sid;
+		perUser(openid).disconnected = false;
+		rememberSession(openid, sid);
 		saveState();
-		return `✅ 已接入会话 [${short}]。后续消息都会继续这个会话。`;
+		return qqText('C06b', { shortId: short });
 	}
 	// ── /new：列出工作区 → 回数字即在该工作区新建会话并接入 ────────────────
 	const pendingNew = {}; // openid -> { list: string[], at: number, mode: { id, name } | null }
+	const pendingModel = {}; // openid -> { phase, groups, provider, models, at }
 	const NEW_TTL_MS = 10 * 60 * 1000;
+	const MODEL_TTL_MS = 10 * 60 * 1000;
 	/** 已知工作区（取自历史会话的 cwd，按最近使用排序；排除已删会话与目录已不存在的旧路径） */
 	async function workspaceList() {
 		const records = await svc.sessionQuery.listSessions();
@@ -1794,23 +1883,18 @@ export function apply(ctx, config) {
 	}
 	/** 模式清单文本（序号可直接写进 mode=） */
 	function modeListText(catalog) {
-		if (!catalog || !catalog.rows.length) return '（当前实例没有可用的会话模式）';
-		const lines = ['可用模式（不填 mode= 则用默认模式；也可写模式 id）：'];
-		catalog.rows.forEach((p, i) => {
-			const mark = p.id === catalog.defaultId ? '   ←默认' : '';
-			lines.push(`  ${i + 1}  ${p.name}   ${p.id}${mark}`);
-		});
-		return lines.join('\n');
+		if (!catalog || !catalog.rows.length) return qqText('C07');
+		return qqText('C08', { rows: catalog.rows.map((p, i) => ({ index: i + 1, name: p.name, id: p.id, isDefault: p.id === catalog.defaultId })) });
 	}
 	/** 解析 mode= 的值：纯数字 → 序号；否则按 preset id 精确匹配。返回 { id, name } 或 { error } */
 	async function resolveMode(token) {
 		const raw = String(token ?? '').trim();
-		if (!raw) return { error: '❌ mode= 后面没写模式（见 /帮助）。' };
+		if (!raw) return { error: qqText('C09') };
 		const catalog = await modeCatalog();
-		if (!catalog) return { error: '❌ 当前实例没有可用的会话模式（agentPresets 未挂载）；/new 只支持选工作区。' };
+		if (!catalog) return { error: qqText('C10') };
 		if (/^\d+$/.test(raw)) {
 			const hit = catalog.rows[Number(raw) - 1];
-			if (!hit) return { error: `❌ 模式序号超范围（1-${catalog.rows.length}）。\n\n${modeListText(catalog)}` };
+			if (!hit) return { error: qqText('C11', { count: catalog.rows.length, modeList: modeListText(catalog) }) };
 			return { id: hit.id, name: hit.name };
 		}
 		const hit = catalog.rows.find((p) => p.id === raw);
@@ -1818,11 +1902,11 @@ export function apply(ctx, config) {
 		// 不在可用清单里：区分「不认识这个 id」与「认识但 discovery 判为 broken」
 		try {
 			const broken = (await svc.agentPresets.list()).find((p) => p && p.id === raw && p.broken !== undefined);
-			if (broken) return { error: `❌ 模式 "${raw}" 当前不可用：${broken.broken}` };
+			if (broken) return { error: qqText('C12', { modeId: raw, reason: broken.broken }) };
 		} catch {
 			/* ignore：按未知模式处理 */
 		}
-		return { error: `❌ 未知模式 "${raw}"。\n\n${modeListText(catalog)}` };
+		return { error: qqText('C13', { modeId: raw, modeList: modeListText(catalog) }) };
 	}
 	/** /new 参数解析：位置参数（纯数字）= 工作区号；k=v = 选项（当前仅 mode） */
 	function parseNewArgs(arg) {
@@ -1832,7 +1916,7 @@ export function apply(ctx, config) {
 			if (eq > 0) {
 				const key = tok.slice(0, eq).trim().toLowerCase();
 				if (key === 'mode') {
-					if (out.modeToken !== undefined) return { error: '❌ mode= 写了两次，只给一个。' };
+					if (out.modeToken !== undefined) return { error: qqText('C14') };
 					out.modeToken = tok.slice(eq + 1).trim();
 				} else {
 					out.unknownKeys.push(key);
@@ -1847,13 +1931,8 @@ export function apply(ctx, config) {
 		return out;
 	}
 	function newListText(list, catalog, mode) {
-		const lines = ['📂 选择工作区（回复数字即可在其下新建会话）：', ''];
-		list.forEach((cwd, i) => lines.push(`${i + 1}、[${cwdLabel(cwd)}]  ${cwd}`));
-		lines.push('');
-		if (mode) lines.push(`将使用模式：${mode.name}（${mode.id}）`, '');
-		lines.push(modeListText(catalog), '');
-		lines.push(`回复 1-${list.length}；也可直接 /new <工作区号> mode=<模式>。`);
-		return lines.join('\n');
+		return qqText('C15', { workspaces: list.map((cwd, i) => ({ index: i + 1, name: cwdLabel(cwd), path: cwd })),
+			modeList: modeListText(catalog), ...(mode ? { modeName: mode.name, modeId: mode.id } : {}) });
 	}
 	/**
 	 * 把会话记账进 Workspace Registry（Web UI 左侧分组依据）；失败只记日志。
@@ -1883,30 +1962,33 @@ export function apply(ctx, config) {
 	/** 在指定工作区新建会话并接入（并把它记账进 Workspace Registry，供 Web UI 分组） */
 	/** 在指定工作区新建会话并接入；opts.mode 非空时指定 agent preset（会话模式）。 */
 	async function makeSessionIn(openid, cwd, opts) {
+		const routingEpoch = perUser(openid).routingEpoch ?? 0;
 		const mode = opts?.mode ?? null;
 		let created;
 		try {
 			created = await svc.sessionController.create(mode ? { cwd, agentPreset: mode.id } : { cwd });
 		} catch (e) {
-			return `❌ 新建失败：${e?.message ?? e}`;
+			return qqText('C16', { error: e?.message ?? e });
 		}
 		const sid = created?.sessionId ?? created?.id;
-		if (!sid) return '❌ 新建失败：未返回会话 ID。';
+		if (!sid) return qqText('C17');
 		await attachToWorkspace(sid, cwd);
+		if ((perUser(openid).routingEpoch ?? 0) !== routingEpoch) return qqText('C18');
 		perUser(openid).sessionId = sid;
+		perUser(openid).disconnected = false;
+		rememberSession(openid, sid);
 		const short = shortIdFor(sid);
 		saveState();
-		const modeLabel = mode ? `（${mode.name}）` : '';
-		return `✅ 已在工作区 [${cwdLabel(cwd)}] 新建会话 [${short}]${modeLabel} 并接入（之后的普通消息都发到这里；/会话 可看列表）。`;
+		return qqText('C19', { workspace: cwdLabel(cwd), shortId: short, ...(mode ? { modeName: mode.name } : {}) });
 	}
 	async function cmdNew(openid, arg) {
 		const parsed = parseNewArgs(arg);
 		if (parsed.error) return parsed.error;
 		if (parsed.stray.length) {
-			return `❌ 无法识别的参数：${parsed.stray.join(' ')}。\n工作区号直接写数字，模式写 mode=<模式>（见 /帮助）。`;
+			return qqText('C20', { argument: parsed.stray.join(' ') });
 		}
 		if (parsed.unknownKeys.length) {
-			return `❌ 暂不支持的选项：${parsed.unknownKeys.join(' ')}（当前 /new 支持 mode=<模式>）。`;
+			return qqText('C21', { key: parsed.unknownKeys.join(' ') });
 		}
 		let mode = null;
 		if (parsed.modeToken !== undefined) {
@@ -1915,10 +1997,10 @@ export function apply(ctx, config) {
 			mode = r;
 		}
 		const list = await workspaceList();
-		if (!list.length) return '当前没有任何已知工作区（还没有历史会话）。';
+		if (!list.length) return qqText('C22');
 		if (parsed.workspaceNo !== undefined) {
 			if (parsed.workspaceNo > list.length) {
-				return `❌ 编号超范围（1-${list.length}）。\n\n${newListText(list, await modeCatalog(), mode)}`;
+				return qqText('C23', { count: list.length, workspaceList: newListText(list, await modeCatalog(), mode) });
 			}
 			return makeSessionIn(openid, list[parsed.workspaceNo - 1], { mode });
 		}
@@ -1938,60 +2020,150 @@ export function apply(ctx, config) {
 		delete pendingNew[openid];
 		if (n > pend.list.length) {
 			pendingNew[openid] = { list: pend.list, at: Date.now(), mode: pend.mode ?? null };
-			modeCatalog().then((cat) => sendText(openid, `❌ 编号超范围（1-${pend.list.length}）。\n\n${newListText(pend.list, cat, pend.mode)}`)).catch(() => {});
+			modeCatalog().then((cat) => sendText(openid, qqText('C24', { count: pend.list.length, workspaceList: newListText(pend.list, cat, pend.mode) }))).catch(() => {});
 			return true;
 		}
 		makeSessionIn(openid, pend.list[n - 1], { mode: pend.mode ?? null })
 			.then((msg) => sendText(openid, msg))
-			.catch((e) => sendText(openid, `❌ 新建失败：${e?.message ?? e}`));
+			.catch((e) => sendText(openid, qqText('C25', { error: e?.message ?? e })));
 		return true;
 	};
 	function cmdInstance(arg) {
-		if (arg) return '单插件模式已绑定当前实例，不支持经 QQ 跨实例切换。跨实例对话请在 Web UI 操作。';
+		if (arg) return qqText('C26');
 		return cmdProfile();
 	}
-	async function cmdStatus() {
-		const lines = ['📊 状态检查：', ''];
-		lines.push(`插件: 已加载 pid=${process.pid} profile=${profile}`);
-		lines.push(`QQ: ${BOT.running ? (BOT.connected ? '已连接 ✓' : '连接中…') : '未启用 ✗（设置页打开"启用"开关）'}`);
-		if (BOT.url) lines.push(`   WS: ${BOT.url}`);
-		try {
-			const liveAgents = svc.agents ? svc.agents.list().length : 0;
-			lines.push(`实例: web:${webPort}  liveAgents:${liveAgents}`);
-		} catch {
-			lines.push(`实例: web:${webPort}`);
+	// 重启职责属于独立后台启动器；本插件只能提交请求，绝不自行结束 App/Host。
+	async function cmdRestart() {
+		const manager = ctx.get('dshInstanceManager');
+		if (!manager || typeof manager.requestRestart !== 'function') {
+			return qqText('C27');
 		}
 		try {
-			const n = (await svc.sessionQuery.listSessions()).length;
-			lines.push(`会话: ${n} 个`);
-		} catch {
-			/* skip */
+			await saveState();
+			const result = await manager.requestRestart();
+			if (!result || result.ok !== true) return qqText('C28', { error: result?.error?.message ?? result?.error ?? '后台启动器不可用' });
+			return qqText('C29');
+		} catch (error) {
+			return qqText('C30', { error: error?.message ?? error });
 		}
-		lines.push('', '指令: /profile /会话 /会话 <ID> /new /权限 /提醒 /实例 <端口> /状态 /帮助');
-		return lines.join('\n');
 	}
-	const CMD_HELP = [
-		'QQ-DSH 桥接（单插件版）',
-		'只回复最终结果，思考过程与工具调用不展示。',
-		'指令：',
-		'  /profile        查看实例',
-		'  /会话           列出会话（按工作区）',
-		'  /会话 <4位ID>    接入某个会话（ID 固定，跨重启不变）',
-		'  /new            新建会话（可带 mode=<模式>；模式清单见 /new 提示）',
-		'  /实例 <端口>     查看实例（跨实例请回 Web UI）',
-		'  /状态           全链路体检',
-		'  /approve        允许当前会话的待审批请求',
-		'  /deny           拒绝待审批请求',
-		'  /跳过           跳过待回答的问题',
-		'  /stop           停止当前会话正在执行的工作',
-		'  /提醒           列出定时推送任务',
-		'  /提醒 删 <ID>   取消某个定时任务（ID 见 /提醒 列表）',
-		'  /权限           查看当前会话权限（sandbox + approval）',
-		'  /权限 <预设名>    切换当前会话权限（如 danger-full-access）',
-		'  /权限 重置       回默认权限 + 审批推 QQ',
-		'  /帮助           本帮助',
-		'普通消息：发给当前接入的会话；未接入则自动新建会话。',
-	].join('\n');
+	function sessionModelSelection(session) {
+		try {
+			const context = session?.requestContext?.();
+			const header = session?.requestHeader?.();
+			const config = header?.config ?? context;
+			if (config?.provider && config?.model) {
+				return { provider: config.provider, model: config.model, ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}) };
+			}
+		} catch {
+			/* 当前会话可能尚未产生请求头 */
+		}
+		return null;
+	}
+	function modelProviderText(groups) {
+		return qqText('C31', { groups });
+	}
+	function modelListText(provider, models) {
+		return qqText('C32', { provider, models });
+	}
+	async function cmdModel(openid) {
+		const sid = perUser(openid).sessionId;
+		if (!sid) return qqText('C33');
+		if (typeof svc.sessionController?.modelCatalog !== 'function') {
+			return qqText('C34');
+		}
+		try {
+			const catalog = await svc.sessionController.modelCatalog();
+			const groups = (Array.isArray(catalog?.groups) ? catalog.groups : [])
+				.filter((g) => g && g.id && Array.isArray(g.models) && g.models.length);
+			if (!groups.length) return qqText('C35');
+			pendingModel[openid] = { phase: 'provider', groups, at: Date.now() };
+			return modelProviderText(groups);
+		} catch (e) {
+			return qqText('C36', { error: e?.message ?? e });
+		}
+	}
+	// 纯数字回复 → 消费 /模型 的供应商/模型两阶段选择；输入 0 随时取消。
+	handleModelPick = (openid, text) => {
+		const pending = pendingModel[openid];
+		if (!pending) return false;
+		const raw = String(text ?? '').trim();
+		if (Date.now() - pending.at > MODEL_TTL_MS) {
+			delete pendingModel[openid];
+			return false;
+		}
+		if (!/^\d+$/.test(raw)) return false;
+		const n = Number(raw);
+		if (n === 0) {
+			delete pendingModel[openid];
+			sendText(openid, qqText('C37')).catch(() => {});
+			return true;
+		}
+		if (pending.phase === 'provider') {
+			const provider = pending.groups[n - 1];
+			if (!provider) {
+				sendText(openid, qqText('C38', { count: pending.groups.length, providerList: modelProviderText(pending.groups) })).catch(() => {});
+				return true;
+			}
+			pendingModel[openid] = { phase: 'model', provider, models: provider.models, at: Date.now() };
+			sendText(openid, modelListText(provider, provider.models)).catch(() => {});
+			return true;
+		}
+		const model = pending.models[n - 1];
+		if (!model) {
+			sendText(openid, qqText('C39', { count: pending.models.length, modelList: modelListText(pending.provider, pending.models) })).catch(() => {});
+			return true;
+		}
+		delete pendingModel[openid];
+		const sid = perUser(openid).sessionId;
+		const request = { sessionId: sid, provider: pending.provider.id, model: model.id };
+		Promise.resolve().then(async () => {
+			if (typeof svc.sessionController?.selectModel !== 'function') throw new Error('当前宿主不支持会话级模型切换，请升级 DSH 后重试');
+			const result = await svc.sessionController.selectModel(request);
+			const selected = result?.selected ?? request;
+			await sendText(openid, qqText('C40', { providerId: selected.provider, modelId: selected.model }));
+		}).catch((e) => sendText(openid, qqText('C41', { error: e?.message ?? e })).catch(() => {}));
+		return true;
+	};
+	async function cmdStatus() {
+		const facts = { pid: process.pid, profile, running: BOT.running, connected: BOT.connected, webPort: webPort ?? '?',
+			...(BOT.url ? { ws: BOT.url } : {}) };
+		try { facts.liveAgents = svc.agents ? svc.agents.list().length : 0; } catch { /* optional */ }
+		try {
+			facts.sessionCount = (await Promise.race([
+				svc.sessionQuery.listSessions(),
+				new Promise((_, reject) => setTimeout(() => reject(new Error('session listing timed out')), 2000)),
+			])).length;
+		} catch (e) { log(`/状态 会话计数不可用: ${e?.message ?? e}`); }
+		// 多实例诊断：桌面 App 退出时可能留下孤儿宿主，多个实例各连一条 QQ → 重复回复
+		try {
+			facts.instances = (await liveInstances()).map(([pid, inst]) => ({ pid,
+				current: Number(pid) === process.pid, cwd: inst?.cwd ?? '?' }));
+		} catch { /* optional */ }
+		return qqText('C42', facts);
+	}
+
+	async function cmdDisconnect(openid) {
+		const per = perUser(openid);
+		per.sessionId = null;
+		per.disconnected = true;
+		per.routingEpoch = (per.routingEpoch ?? 0) + 1;
+		delete pendingNew[openid];
+		delete pendingModel[openid];
+		for (const [sid, run] of runs) {
+			if (run.openid !== openid) continue;
+			run.detached = true;
+			run.stopTyping?.();
+			runs.delete(sid);
+		}
+		for (let i = progressQueue.length - 1; i >= 0; i--) {
+			if (progressQueue[i].openid === openid) progressQueue.splice(i, 1);
+		}
+		// 桌面卡片始终归官方 answerer；断开只清理 QQ 元数据。
+		for (const entry of [...(pendingApprovals[openid] ?? []), ...(pendingQuestions[openid] ?? [])]) finishInteraction(entry, 'detached', '');
+		await saveState();
+		return qqText('C44');
+	}
 	function handleCommand(openid, text) {
 		const [head, ...rest] = text.split(/\s+/);
 		const arg = rest.join(' ').trim();
@@ -2000,11 +2172,19 @@ export function apply(ctx, config) {
 				return cmdProfile();
 			case '/实例':
 				return arg ? cmdInstance(arg) : cmdProfile();
+			case '/断开':
+			case '/disconnect':
+				return cmdDisconnect(openid);
 			case '/会话':
 				return arg ? cmdAttach(openid, arg) : cmdSessions(openid);
 			case '/new':
 			case '/新建':
 				return cmdNew(openid, arg);
+			case '/模型':
+			case '/model':
+				return cmdModel(openid);
+			case '/restart':
+				return cmdRestart();
 			case '/状态':
 			case '/status':
 				return cmdStatus();
@@ -2028,9 +2208,9 @@ export function apply(ctx, config) {
 			case '/帮助':
 			case '/help':
 			case '/?':
-				return Promise.resolve(CMD_HELP);
+				return Promise.resolve(qqText('C43'));
 			default:
-				return Promise.resolve(`未知指令 ${head}。用 /帮助 查看指令。`);
+				return Promise.resolve(qqText('C45', { command: head }));
 		}
 	}
 	// ── QQ 消息 → DSH 的完整处理（含输入状态保活）───────────────────────────
@@ -2044,13 +2224,18 @@ export function apply(ctx, config) {
 	 *   若某条仍被接口拒（"太大"），**自动二分重试**直到单条 ≤ QQ_SPLIT_FLOOR，绝不整条丢。
 	 * - `msg_id` 只挂在第一条上（被动回复的 msg_id + msg_seq 组合不能重复）。
 	 */
-	async function sendText(openid, content, msgId) {
+	async function sendText(openid, content, msgId, { completionNotice = false } = {}) {
+		// /断开仅静音实时会话消息；完成通知仍由 notifyOnComplete 独立控制。
+		if (perUser(openid).disconnected && !msgId && !completionNotice) return;
+		const epoch = perUser(openid).routingEpoch ?? 0;
+		const stalePush = () => !msgId && (!completionNotice && perUser(openid).disconnected || (perUser(openid).routingEpoch ?? 0) !== epoch);
 		const cfg = readCfg();
 		const token = await ensureToken(cfg.appId, cfg.appSecret);
 		const base = apiBase(cfg);
 		const useMarkdown = looksLikeMarkdown(content);
 		/** 单条发送：要 markdown 就优先 markdown、失败降级纯文本；再失败就二分。 */
 		const sendOne = async (text, attachMsgId) => {
+			if (stalePush()) return;
 			if (useMarkdown) {
 				const md = { msg_type: 2, msg_seq: ++BOT.msgSeq, markdown: { content: text } };
 				if (attachMsgId) md.msg_id = attachMsgId;
@@ -2061,6 +2246,7 @@ export function apply(ctx, config) {
 					log(`markdown 发送失败（降级纯文本）: ${e?.message ?? e}`);
 				}
 			}
+			if (stalePush()) return;
 			const plain = { content: text, msg_type: 0, msg_seq: ++BOT.msgSeq };
 			if (attachMsgId) plain.msg_id = attachMsgId;
 			try {
@@ -2077,6 +2263,7 @@ export function apply(ctx, config) {
 		for (let i = 0; i < chunks.length; i += 1) await sendOne(chunks[i], msgId && i === 0 ? msgId : null);
 	}
 	async function sendTyping(openid) {
+		if (perUser(openid).disconnected) return;
 		const cfg = readCfg();
 		const token = await ensureToken(cfg.appId, cfg.appSecret);
 		await postMessage(apiBase(cfg), token, openid, {
@@ -2106,20 +2293,49 @@ export function apply(ctx, config) {
 	// ── 审批（approval）桥接：QQ 会话的审批由 QQ 用户决定 ───────────────────
 	// answerer 以 prepend+global 注册在瀑布最外层：QQ 会话直接接管（不 next），
 	// 非 QQ 会话立即 next() 交给 Web UI 等下游 answerer。
-	function removePending(openid, entry) {
-		const q = pendingApprovals[openid];
-		if (!q) return;
-		const i = q.indexOf(entry);
-		if (i >= 0) q.splice(i, 1);
-		if (q.length === 0) delete pendingApprovals[openid];
-	}
-	function settlePending(openid, entry, outcome) {
-		if (entry.done) return;
+	function finishInteraction(entry, source, summary) {
+		if (!entry || entry.done) return false;
 		entry.done = true;
-		clearTimeout(entry.timer);
-		if (entry.signal && entry.onAbort) entry.signal.removeEventListener('abort', entry.onAbort);
-		removePending(openid, entry);
-		entry.resolve(outcome);
+		for (const queue of [pendingApprovals, pendingQuestions]) {
+			const items = queue[entry.openid];
+			if (items) { const i = items.indexOf(entry); if (i >= 0) items.splice(i, 1); if (!items.length) delete queue[entry.openid]; }
+		}
+		const data = state.interactive;
+		data.pending = data.pending.filter((p) => p.id !== entry.id);
+		data.commands = data.commands.filter((c) => c.id !== entry.id);
+		data.recent.unshift({ id: entry.id, sessionId: entry.sessionId, source, summary, settledAt: Date.now() });
+		data.recent = data.recent.slice(0, 50);
+		void saveState();
+		if (source !== 'detached') sendText(entry.openid, qqText(source === 'qq' ? 'I04' : 'I05', { summary })).catch(() => {});
+		return true;
+	}
+	function enqueueInteraction(entry, answer) {
+		if (entry.done) return;
+		const commands = state.interactive.commands;
+		if (!commands.some((c) => c.id === entry.id)) commands.push({ id: entry.id, answer });
+		void saveState();
+	}
+	/**
+	 * 交互结束收尾。
+	 * @param {Object} entry - 交互条目
+	 * @param {any} outcome - 下游/QQ 给出的结果
+	 * @param {'qq'|'desktop'} [source] - 结论来源（决定 QQ 回复 I04 还是 I05）
+	 */
+	function finishAfterAnswer(entry, outcome, source = 'desktop') {
+		// Give the browser's POST /ack a bounded window after official pending.answer().
+		if (state.interactive.commands.some((c) => c.id === entry.id)) {
+			setTimeout(() => finishInteraction(entry, source, JSON.stringify(outcome)), 500);
+			return;
+		}
+		finishInteraction(entry, source, JSON.stringify(outcome));
+	}
+	function trackInteraction(openid, data) {
+		const entry = { id: randomUUID(), openid, ...data, createdAt: Date.now() };
+		state.interactive.pending.push(entry);
+		const target = entry.kind === 'approval' ? pendingApprovals : pendingQuestions;
+		(target[openid] ??= []).push(entry);
+		void saveState();
+		return entry;
 	}
 	async function sendApprovalPrompt(openid, req, ownerSessionId) {
 		const sid = req.agent.id;
@@ -2131,22 +2347,90 @@ export function apply(ctx, config) {
 				if (tc?.data?.arguments) {
 					let a = String(tc.data.arguments);
 					if (a.length > 200) a = a.slice(0, 200) + '…';
-					argsText = `参数：${a}`;
+					argsText = qqText('I02c', { arguments: a });
 				}
 			} catch { /* best-effort */ }
 		}
 		const cur = perUser(openid).sessionId;
 		const who = sid === cur ? '当前会话' : `会话 [${displayShort(sid)}]`;
 		const lines = [
-			`🔐 需要你的审批（${who}）`,
-			`工具：${req.toolName ?? '?'}`,
-			...(req.reason ? [`原因：${req.reason}`] : []),
+			qqText('I01', { sessionLabel: who }),
+			qqText('I02a', { toolName: req.toolName ?? '?' }),
+			...(req.reason ? [qqText('I02b', { reason: req.reason })] : []),
 			...(argsText ? [argsText] : []),
-			'回复 /approve 允许执行一次，/deny 拒绝；超时将自动拒绝。',
+			qqText('I03'),
 		];
 		await sendText(openid, lines.join('\n'));
 	}
+	// ── QQ 指令直接兑现（穿透等待态）────────────────────────────────────────
+	/** QQ 指令 → 审批结果的合法取值。 */
+	const APPROVAL_ANSWERS = new Set(['allowed-once', 'allowed-always', 'rejected']);
+	/**
+	 * 读取某条交互在 state 文件里的待兑现指令（**从磁盘读**，避免与 loadState 换对象竞争）。
+	 * @param {string} entryId - 交互 id（trackInteraction 生成）
+	 * @returns {Object|null} { id, answer }；没有则 null
+	 */
+	function readCommandAnswer(entryId) {
+		try {
+			const raw = JSON.parse(readFileSync(stateFile(), 'utf8'));
+			const commands = Array.isArray(raw?.interactive?.commands) ? raw.interactive.commands : [];
+			return commands.find((c) => c?.id === entryId) ?? null;
+		} catch {
+			return null;
+		}
+	}
+	/**
+	 * 等待 QQ 侧对某条交互的答复。
+	 * - 先看内存里排队的指令（同进程内 /approve 已入队的情况），
+	 * - 之后每 300ms 从 state 文件读一次（跨进程/跨重启也能看到）。
+	 * 只 resolve、不 reject；外层用 Promise.race 与桌面路径竞争，不依赖取消。
+	 * @param {string} entryId - 交互 id
+	 * @returns {Promise<Object|null>} 指令条目，或 null 表示"暂时没有"
+	 */
+	function waitForCommandAnswer(entryId) {
+		const immediate = (state.interactive.commands ?? []).find((c) => c?.id === entryId);
+		if (immediate) return Promise.resolve(immediate);
+		return new Promise((resolve) => {
+			const timer = setInterval(() => {
+				const found = readCommandAnswer(entryId);
+				if (found) { clearInterval(timer); resolve(found); }
+			}, 300);
+			timer.unref?.();
+		});
+	}
+	/**
+	 * 一条审批的结论：**QQ 的 /approve /deny 与桌面卡片并行生效，谁先到用谁**。
+	 * 这是 `/approve` 在"等待消息"状态下能直接穿透的关键——旧实现只把决定排进
+	 * state.interactive.commands 等桌面卡片消费，卡片不在就永远悬着。
+	 * @param {Object} entry - trackInteraction 的审批条目
+	 * @param {() => Promise<string>} next - 下游 answerer（官方桌面卡片）
+	 * @returns {Promise<string>} 'allowed-once' | 'allowed-always' | 'rejected' | 'cancelled'
+	 */
+	async function approvalDecision(entry, next) {
+		return commandDecision(entry, next, (answer) => APPROVAL_ANSWERS.has(answer));
+	}
+	/**
+	 * 通用「QQ 指令 / 桌面卡片 谁先到用谁」决策。
+	 * @param {Object} entry - trackInteraction 生成的交互条目
+	 * @param {() => Promise<any>} next - 下游 answerer（官方桌面卡片）
+	 * @param {(answer: any) => boolean} accepts - 判断排队指令里的 answer 是否本流程可用的形状
+	 * @returns {Promise<any>} 下游或 QQ 的答案（QQ 分支返回 answer 原值）
+	 */
+	async function commandDecision(entry, next, accepts) {
+		// 桌面分支先启动：它会立刻走到下一层 answerer（官方卡片），不能因为等 QQ 而延后
+		const desktop = Promise.resolve(next()).then((outcome) => ({ source: 'desktop', answer: outcome }));
+		const qq = waitForCommandAnswer(entry.id).then((cmd) => (cmd && accepts(cmd.answer) ? { source: 'qq', answer: cmd.answer } : undefined));
+		const winner = await Promise.race([desktop, qq]);
+		// 桌面先答 → 把没人消费的 QQ 指令清掉，避免留下悬空指令
+		if (winner.source === 'desktop') {
+			const stale = state.interactive.commands ?? [];
+			const kept = stale.filter((c) => c?.id !== entry.id);
+			if (kept.length !== stale.length) { state.interactive.commands = kept; void saveState(); }
+		}
+		return { answer: winner.answer, source: winner.source };
+	}
 	async function approvalListener(req, next) {
+		let delegated = false;
 		try {
 			if (!BOT.running) return next(); // 机器人未运行 → 交给 Web UI 等其他 answerer
 			const session = req?.agent?.session;
@@ -2158,7 +2442,7 @@ export function apply(ctx, config) {
 				if (p?.sessionId) sessionToOpenid.set(p.sessionId, o);
 			}
 			for (const [s, r] of runs) {
-				if (r?.openid && !sessionToOpenid.has(s)) sessionToOpenid.set(s, r.openid);
+				if (r?.openid && !r.detached && !perUser(r.openid).disconnected && !sessionToOpenid.has(s)) sessionToOpenid.set(s, r.openid);
 			}
 			let openid;
 			let ownerSessionId;
@@ -2173,64 +2457,37 @@ export function apply(ctx, config) {
 				}
 			}
 			// 「等你审批」也算会话状态：没在聊这个会话的用户会收到一条 QQ 通知（审批本身仍走原路）
-			notifyWaiting(session, `需要审批：${req?.toolName ?? '?'}${req?.reason ? `（${String(req.reason).replace(/\s+/g, ' ').trim().slice(0, 40)}）` : ''}`);
+			notifyWaiting(session, (sessionName) => qqText('N02', { sessionName, toolName: req?.toolName ?? '?', ...(req?.reason ? { reason: String(req.reason).replace(/\s+/g, ' ').trim().slice(0, 40) } : {}) }));
 			if (openid === undefined) return next(); // 非 QQ 会话 → 交给 Web UI 等其他 answerer
-			const entry = {
-				sessionId: sid,
-				ownerSessionId,
-				toolName: req.toolName,
-				callId: req.callId,
-				reason: req.reason,
-				done: false,
-				resolve: null,
-				timer: null,
-				signal: null,
-				onAbort: null,
-			};
-			const outcome = await new Promise((resolve) => {
-				entry.resolve = resolve;
-				const timeoutMs = readCfg().chatTimeoutMs || 300000;
-				entry.timer = setTimeout(() => {
-					settlePending(openid, entry, 'rejected');
-					sendText(openid, '⏰ 审批超时（未在限期内回复），已自动拒绝。').catch(() => {});
-				}, timeoutMs);
-				entry.timer.unref?.();
-				if (req.signal) {
-					entry.signal = req.signal;
-					entry.onAbort = () => settlePending(openid, entry, 'cancelled');
-					req.signal.addEventListener('abort', entry.onAbort, { once: true });
-				}
-				(pendingApprovals[openid] ?? (pendingApprovals[openid] = [])).push(entry);
-				sendApprovalPrompt(openid, req, ownerSessionId).catch(() => {});
-			});
-			return outcome;
-		} catch {
+			const entry = trackInteraction(openid, { sessionId: sid, ownerSessionId, kind: 'approval', toolName: req.toolName, callId: req.callId, reason: req.reason });
+			sendApprovalPrompt(openid, req, ownerSessionId).catch(() => {});
+			try {
+				delegated = true;
+				// QQ 的 /approve /deny 直接在本 answerer 里兑现：不再只往 state.interactive.commands
+				// 里排队、等桌面卡片去消费（桌面卡片不在/没渲染时，旧实现会让审批永远悬着，QQ 只回
+				// 「指令已排队…」）。桌面卡片仍并行生效，谁先到用谁。
+				const decision = await approvalDecision(entry, next);
+				finishAfterAnswer(entry, decision.answer, decision.source);
+				return decision.answer;
+			} catch (error) { finishInteraction(entry, 'desktop', '请求已结束'); throw error; }
+		} catch (error) {
+			if (delegated) throw error;
 			return next();
 		}
 	}
 	async function cmdApprove(openid, allow) {
 		const q = pendingApprovals[openid];
-		if (!q || q.length === 0) return '当前没有待审批的请求。';
+		if (!q || q.length === 0) return qqText('C49');
 		const entry = q[0];
 		if (allow && entry.ownerSessionId !== perUser(openid).sessionId) {
-			return `有待审批请求，但它属于会话 [${displayShort(entry.sessionId)}]，不是当前接入的会话（同意的指令只对当前会话生效）。请先 /会话 切换到对应会话。`;
+			return qqText('C50', { shortId: displayShort(entry.sessionId) });
 		}
-		settlePending(openid, entry, allow ? 'allowed-once' : 'rejected');
-		return allow ? '✅ 已允许该操作执行。' : '❌ 已拒绝该操作。';
+		enqueueInteraction(entry, allow ? 'allowed-once' : 'rejected');
+		return qqText('C51');
 	}
 	// ── 用户问答（user-questions）桥接：模型调 ask_user_question 时经 QQ 收集回答 ──
 	function settleQuestion(openid, entry, answers, notify) {
-		if (entry.done) return;
-		entry.done = true;
-		clearTimeout(entry.timer);
-		if (entry.signal && entry.onAbort) entry.signal.removeEventListener('abort', entry.onAbort);
-		const q = pendingQuestions[openid];
-		if (q) {
-			const i = q.indexOf(entry);
-			if (i >= 0) q.splice(i, 1);
-			if (q.length === 0) delete pendingQuestions[openid];
-		}
-		entry.resolve(answers ?? { answers: [] });
+		enqueueInteraction(entry, answers ?? { answers: [] });
 		if (notify) sendText(openid, notify).catch(() => {});
 	}
 	function buildQuestionAnswers(questions, picks) {
@@ -2249,25 +2506,25 @@ export function apply(ctx, config) {
 	async function sendQuestionPrompt(openid, entry) {
 		const cur = perUser(openid).sessionId;
 		const who = entry.sessionId === cur ? '当前会话' : `会话 [${displayShort(entry.sessionId)}]`;
-		const lines = [`❓ 需要你回答（${who}）`];
+		const lines = [qqText('I06', { sessionLabel: who })];
 		entry.questions.forEach((q, qi) => {
 			const num = qi + 1;
-			lines.push(`${num}、${q.question ?? '（无标题问题）'}`);
-			if (q.detail) lines.push(`　${q.detail}`);
+			lines.push(qqText('I07', { index: num, question: q.question ?? '（无标题问题）', ...(q.detail ? { detail: q.detail } : {}) }));
 			const opts = Array.isArray(q.options) ? q.options : [];
 			if (opts.length > 0) {
 				opts.forEach((o, oi) => {
-					lines.push(`　${oi + 1}) ${o.label}${o.description ? `（${o.description}）` : ''}`);
+					lines.push(qqText('I08', { index: oi + 1, label: o.label, ...(o.description ? { description: o.description } : {}) }));
 				});
 			} else {
-				lines.push('　（自由回答：直接输入文本）');
+				lines.push(qqText('I09'));
 			}
-			if (q.multiSelect === true) lines.push('　多选：选项号用逗号分隔');
+			if (q.multiSelect === true) lines.push(qqText('I08m'));
 		});
-		lines.push('直接输入答案即可；多题用「题号+分隔符」开头（如 1. 2 / 2、1），后续行算该题续行（可多行作答）；多选可用 , 、 | / \\ 分隔；/跳过 跳过。');
+		lines.push(qqText('I10'));
 		await sendText(openid, lines.join('\n'));
 	}
 	async function userQuestionListener(req, next) {
+		let delegated = false;
 		try {
 			if (!BOT.running) return next();
 			const session = req?.agent?.session;
@@ -2277,7 +2534,7 @@ export function apply(ctx, config) {
 				if (p?.sessionId) sessionToOpenid.set(p.sessionId, o);
 			}
 			for (const [s, r] of runs) {
-				if (r?.openid && !sessionToOpenid.has(s)) sessionToOpenid.set(s, r.openid); // 无头定时会话：问题也推给那个用户
+				if (r?.openid && !r.detached && !perUser(r.openid).disconnected && !sessionToOpenid.has(s)) sessionToOpenid.set(s, r.openid); // 无头定时会话：问题也推给那个用户
 			}
 			let openid;
 			let ownerSessionId;
@@ -2295,36 +2552,32 @@ export function apply(ctx, config) {
 			if (questions.length === 0) return next();
 			// 「等你在 Web UI 里选」也算会话状态：没在聊这个会话的用户会收到一条 QQ 通知
 			const q0 = String(questions[0]?.question ?? '（无标题问题）').replace(/\s+/g, ' ').trim().slice(0, 40);
-			notifyWaiting(session, `在等你选择：${q0}${questions.length > 1 ? `（共 ${questions.length} 题）` : ''}`);
+			notifyWaiting(session, (sessionName) => qqText('N03', { sessionName, question: q0, ...(questions.length > 1 ? { count: questions.length } : {}) }));
 			if (openid === undefined) return next();
-			const entry = { sessionId: sid, ownerSessionId, questions, done: false, resolve: null, timer: null, signal: null, onAbort: null };
-			const outcome = await new Promise((resolve) => {
-				entry.resolve = resolve;
-				const timeoutMs = readCfg().chatTimeoutMs || 300000;
-				entry.timer = setTimeout(() => settleQuestion(openid, entry, { answers: [] }, '⏰ 问答超时，已跳过。'), timeoutMs);
-				entry.timer.unref?.();
-				if (req.signal) {
-					entry.signal = req.signal;
-					entry.onAbort = () => settleQuestion(openid, entry, { answers: [] }, null);
-					req.signal.addEventListener('abort', entry.onAbort, { once: true });
-				}
-				(pendingQuestions[openid] ?? (pendingQuestions[openid] = [])).push(entry);
-				sendQuestionPrompt(openid, entry).catch(() => {});
-			});
-			return outcome;
-		} catch {
+			const entry = trackInteraction(openid, { sessionId: sid, ownerSessionId, kind: 'question', questions });
+			sendQuestionPrompt(openid, entry).catch(() => {});
+			try {
+				delegated = true;
+				// 与审批同一条规则：QQ 侧的回答（/答、选项编号、自由文本）在本 answerer 里直接兑现，
+				// 不再只排队等桌面卡片消费。
+				const decision = await commandDecision(entry, next, (answer) => answer !== null && typeof answer === 'object');
+				finishInteraction(entry, decision.source, JSON.stringify(decision.answer));
+				return decision.answer;
+			} catch (error) { finishInteraction(entry, 'desktop', '请求已结束'); throw error; }
+		} catch (error) {
+			if (delegated) throw error;
 			return next();
 		}
 	}
 	async function cmdSkipQuestion(openid) {
 		const q = pendingQuestions[openid];
-		if (!q || q.length === 0) return '当前没有待回答的问题。';
+		if (!q || q.length === 0) return qqText('C54');
 		const entry = q[0];
 		if (entry.ownerSessionId !== perUser(openid).sessionId) {
-			return `有待回答的问题，但它属于会话 [${displayShort(entry.sessionId)}]，不是当前接入的会话。请先 /会话 切换到对应会话。`;
+			return qqText('C55', { shortId: displayShort(entry.sessionId) });
 		}
 		settleQuestion(openid, entry, { answers: [] }, null);
-		return '⏭️ 已跳过该问题。';
+		return qqText('I13');
 	}
 	/**
 	 * 结构化多题作答解析：每行「题号. 选项号/文本」（分隔符接受 . 、 : ： ) ））。
@@ -2393,31 +2646,31 @@ export function apply(ctx, config) {
 		const structured = parseStructuredPicks(entry.questions, text);
 		const picks = structured ?? entry.questions.map((qq, i) => (i === 0 ? { picked: [], custom: String(text ?? '') } : { picked: [], custom: '' }));
 		settleQuestion(openid, entry, buildQuestionAnswers(entry.questions, picks), null);
-		sendText(openid, structured ? '✅ 已按「题号. 选项」解析并提交回答。' : '✅ 已收到你的回答。').catch(() => {});
+		sendText(openid, qqText(structured ? 'I11' : 'I12')).catch(() => {});
 		return true;
 	};
 
 	/** /stop：停止当前接入会话正在执行的工作，并丢弃队列中未处理的消息 */
 	async function cmdStop(openid) {
 		const sid = perUser(openid).sessionId;
-		if (!sid) return '当前没有接入任何会话。';
+		if (!sid) return qqText('C59');
 		try {
 			const r = await svc.sessionController.resolveAgent(sid);
-			if (!r || !r.agent) return `⏹️ 该会话当前未附着（${r?.error?.message ?? '未知'}）。`;
+			if (!r || !r.agent) return qqText('C60', { error: r?.error?.message ?? '未知' });
 			// keepInbox: false → agent.inbox.clear()：中断的同时丢弃未处理消息
 			// （官方 sessionController.cancel 写死 keepInbox:true，会把队列留到下次输入时一起处理）
 			r.agent.cancel({ kind: 'user' }, { keepInbox: false });
-			return '⏹️ 已停止当前会话的工作，并丢弃了队列中未处理的消息。';
+			return qqText('C61');
 		} catch (e) {
-			return `⏹️ 当前会话没有正在运行的工作（${e?.message ?? e}）。`;
+			return qqText('C62', { error: e?.message ?? e });
 		}
 	}
 	/** /权限 [预设名|重置]：查看 / 切换当前接入会话的权限预设（sandbox + approval 一起切）。 */
 	async function cmdPermission(openid, arg) {
 		const sid = perUser(openid).sessionId;
-		if (!sid) return '当前没有接入任何会话。用 /会话 <ID> 接入，或直接发一条普通消息自动新建。';
+		if (!sid) return qqText('C63');
 		const svcPerm = svc.permissionPresets;
-		if (!svcPerm || typeof svcPerm.set !== 'function') return '❌ 当前实例没有 permissionPresets 服务，无法切换权限。';
+		if (!svcPerm || typeof svcPerm.set !== 'function') return qqText('C64');
 		let agent = null;
 		try {
 			const r = await svc.sessionController.resolveAgent(sid);
@@ -2426,21 +2679,14 @@ export function apply(ctx, config) {
 			/* 未附着时退回 sessions 里的实例 */
 		}
 		const session = agent?.session ?? svc.sessions?.get?.(sid);
-		if (!session) return `❌ 会话 [${shortIdFor(sid)}] 当前未附着，先发一条消息把它唤起来再切权限。`;
+		if (!session) return qqText('C65', { shortId: shortIdFor(sid) });
 		const names = permissionPresetNames(svcPerm);
 		const want = String(arg ?? '').trim();
 		const chosen = state.permPreset?.[sid] ?? null;
 		if (!want) {
 			const st = svcPerm.permissionState?.(session) ?? {};
-			return [
-				`🔐 当前会话权限：${svcPerm.current?.(session) ?? '?'}`,
-				`　sandbox：${st.sandbox ?? '（默认）'}`,
-				`　approval：${st.approval ?? '（默认）'}`,
-				chosen ? `　（你在 QQ 里指定过「${chosen}」，桥接不再自动改回 ask）` : '　（未指定：桥接会保证 approval=ask，审批推给 QQ）',
-				'',
-				`可切换：${names.join(' / ') || '（无）'}`,
-				'用法：/权限 <预设名>；/权限 重置（回默认 + approval=ask）',
-			].join('\n');
+			return qqText('C66', { preset: svcPerm.current?.(session) ?? '?', sandbox: st.sandbox ?? '（默认）',
+				approval: st.approval ?? '（默认）', names: names.join(' / ') || '（无）', ...(chosen ? { chosen } : {}) });
 		}
 		if (['重置', 'reset', '默认'].includes(want)) {
 			const def = svcPerm.defaultPreset ?? names[0] ?? 'workspace-write';
@@ -2449,33 +2695,121 @@ export function apply(ctx, config) {
 			svcPerm.set(session, def);
 			if (agent && svc.approval) svc.approval.setPolicy(agent, 'ask');
 			log(`权限重置：会话 ${displayShort(sid)} → ${def}（approval=ask）`);
-			return `✅ 已重置为默认权限「${def}」（approval=ask，审批推给 QQ）。`;
+			return qqText('C67', { preset: def });
 		}
-		if (!names.includes(want)) return `❌ 没有「${want}」这个预设。可选：${names.join(' / ') || '（无）'}`;
+		if (!names.includes(want)) return qqText('C68', { preset: want, names: names.join(' / ') || '（无）' });
 		svcPerm.set(session, want);
 		if (!state.permPreset) state.permPreset = {};
 		state.permPreset[sid] = want;
 		saveState();
 		const st = svcPerm.permissionState?.(session) ?? {};
 		log(`权限切换：会话 ${displayShort(sid)} → ${want}（sandbox=${st.sandbox}, approval=${st.approval}）`);
-		return `✅ 当前会话权限已切到「${want}」（sandbox=${st.sandbox ?? '?'}，approval=${st.approval ?? '?'}）。`;
+		return qqText('C69', { preset: want, sandbox: st.sandbox ?? '?', approval: st.approval ?? '?' });
 	}
-	/** /提醒 [删 <ID>]：列出 / 取消定时推送任务。 */
-	async function cmdSchedule(arg) {
+	/**
+	 * 官方目录的返回形状容错：正常是数组，但不同版本/Remote 封装可能给
+	 * 数组包一层或给「id → entry」映射；这里统一归一成数组，避免整条命令静默变空。
+	 */
+	function scheduleEntries(value) {
+		if (Array.isArray(value)) return value.filter((x) => x && typeof x === 'object');
+		if (!value || typeof value !== 'object') return [];
+		for (const key of ['entries', 'items', 'value', 'records', 'tasks', 'list']) {
+			if (Array.isArray(value[key])) return value[key].filter((x) => x && typeof x === 'object');
+		}
+		return Object.values(value).filter((x) => x && typeof x === 'object' && x.id);
+	}
+	/**
+	 * 读官方计划任务目录（与桌面端「计划任务」页同源）：active + 已停止都给。
+	 * 首选 catalog()（宿主级全量）；读不到或为空时退回官方工具同款 list({sessionId})。
+	 * 两者都失败才算失败（C80），避免像以前那样静默回「没有任务」。
+	 */
+	async function readScheduleCatalog(api, per) {
+		let error = null;
+		let entries = [];
+		if (typeof api.catalog === 'function') {
+			try {
+				entries = scheduleEntries(await api.catalog());
+			} catch (e) {
+				error = e;
+				log(`计划任务目录读取失败: ${e?.message ?? e}`);
+			}
+		} else {
+			error = new Error('schedule.catalog 不可用');
+		}
+		if (entries.length === 0 && typeof api.list === 'function') {
+			const sids = [...new Set([per?.sessionId, ...(Array.isArray(per?.sessions) ? per.sessions : [])].filter(Boolean))];
+			for (const sid of sids) {
+				try {
+					const rows = scheduleEntries(await api.list({ sessionId: sid }));
+					for (const row of rows) entries.push({ ...row, sessionId: row?.sessionId ?? sid, status: row?.status ?? 'active' });
+				} catch (e) {
+					error = error ?? e;
+					log(`计划任务列表读取失败（${displayShort(sid)}）: ${e?.message ?? e}`);
+				}
+			}
+		}
+		return { entries, error };
+	}
+	/**
+	 * 官方 schedule 记录 → 一行 QQ 文本（目录里的 T06）。
+	 * 只做本地时间换算、截断与「←当前」标记；规则名称、图标、括号等文案全在 messages.js。
+	 */
+	function scheduleRow(entry, nowMs, currentSessionId) {
+		const d = new Date(entry?.scheduledAt ?? nowMs);
+		const pad = (n) => String(n).padStart(2, '0');
+		const next = Number.isNaN(d.getTime()) ? '?' : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+		return qqText('T06', {
+			id: String(entry?.id ?? '?').slice(0, 8),
+			title: oneLine(entry?.title, 40),
+			kind: entry?.kind ?? 'at',
+			...(entry?.everySeconds === undefined ? {} : { everySeconds: entry.everySeconds }),
+			...(entry?.time === undefined ? {} : { time: entry.time }),
+			...(Array.isArray(entry?.weekdays) ? { weekdays: entry.weekdays } : {}),
+			...(entry?.expression === undefined ? {} : { expression: entry.expression }),
+			...(entry?.timeZone === undefined ? {} : { timeZone: entry.timeZone }),
+			next,
+			session: shortIdFor(entry?.sessionId),
+			active: entry?.status !== 'inactive',
+			current: !!currentSessionId && entry?.sessionId === currentSessionId,
+		});
+	}
+	/**
+	 * /提醒 [删 <ID>]：**直接查看官方计划任务**（与桌面端任务页同源，含已停止）。
+	 * 删除支持唯一前缀；只有「该任务所在会话正绑在别的 QQ 账号上」才拒绝（C78），
+	 * 避免一个 QQ 号删掉另一个 QQ 号会话里的任务。
+	 */
+	async function cmdSchedule(openid, arg) {
+		const api = svc.schedule;
+		if (!api || typeof api.catalog !== 'function' && typeof api.list !== 'function') return qqText('C77');
+		const per = perUser(openid);
+		const { entries, error } = await readScheduleCatalog(api, per);
+		const all = entries;
 		const parts = String(arg ?? '').trim().split(/\s+/).filter(Boolean);
 		if (parts.length >= 2 && ['删', '取消', 'del', 'rm', 'delete'].includes(parts[0].toLowerCase())) {
-			const id = parts[1];
-			const before = schedule.tasks.length;
-			schedule.tasks = schedule.tasks.filter((t) => t.id !== id);
-			if (schedule.tasks.length === before) return `找不到定时任务 [${id}]。用 /提醒 查看列表。`;
-			await saveSchedule();
-			log(`定时任务 ${id} 已由 QQ 用户取消`);
-			return `✅ 已取消定时任务 [${id}]（还剩 ${schedule.tasks.length} 个）。`;
+			if (typeof api.delete !== 'function') return qqText('C77');
+			const prefix = parts[1];
+			const exact = all.filter((entry) => String(entry.id) === prefix);
+			const hits = exact.length ? exact : all.filter((entry) => String(entry.id).startsWith(prefix));
+			if (hits.length === 0) return error && all.length === 0 ? qqText('C80', { error: error?.message ?? error }) : qqText('C70', { id: prefix });
+			if (hits.length > 1) return qqText('C79', { prefix });
+			const owner = openidForSession(hits[0].sessionId);
+			if (owner && owner !== openid) return qqText('C78', { shortId: shortIdFor(hits[0].sessionId) });
+			try {
+				const result = await api.delete({ sessionId: hits[0].sessionId, id: hits[0].id });
+				if (!result || result.deleted !== true) return qqText('C70', { id: prefix });
+			} catch (e) {
+				log(`计划任务取消失败: ${e?.message ?? e}`);
+				return qqText('C80', { error: e?.message ?? e });
+			}
+			log(`计划任务 ${hits[0].id} 已由 QQ 用户取消（会话 ${displayShort(hits[0].sessionId)}）`);
+			return qqText('C71', { id: String(hits[0].id).slice(0, 8), count: Math.max(0, all.length - 1) });
 		}
-		if (schedule.tasks.length === 0) return '当前没有定时任务。直接跟我说「每天 8 点提醒我喝水」这类话即可添加。';
+		if (all.length === 0) return error ? qqText('C80', { error: error?.message ?? error }) : qqText('C72');
 		const now = Date.now();
-		const lines = [...schedule.tasks].sort((a, b) => a.at - b.at).map((t) => scheduleLine(t, now));
-		return [`🕒 定时任务（${schedule.tasks.length} 个，按下次触发排序）：`, ...lines, '', '取消：/提醒 删 <ID>'].join('\n');
+		const rows = [...all]
+			.sort((a, b) => String(a?.scheduledAt ?? '').localeCompare(String(b?.scheduledAt ?? '')))
+			.map((entry) => scheduleRow(entry, now, per.sessionId));
+		return qqText('C73', { count: all.length, rows });
 	}
 	handleUserText = async (openid, msgId, text, images = []) => {
 		const per = perUser(openid);
@@ -2485,6 +2819,11 @@ export function apply(ctx, config) {
 			return;
 		}
 		if (!text && images.length === 0) return;
+		if (per.disconnected) {
+			await sendText(openid, qqText('C74'), msgId);
+			return;
+		}
+		const routingEpoch = per.routingEpoch ?? 0;
 		// 立即提交给 DSH（排队/插话由 DSH 原生模式决定），由回复观察器负责把结果回给 QQ
 		try {
 			// 图片先下载成 base64（QQ 的 CDN 链接有时效），失败要在提交前告诉用户
@@ -2494,18 +2833,22 @@ export function apply(ctx, config) {
 					imageParts = await downloadQqImages(images);
 				} catch (e) {
 					log(`图片接收失败: ${e?.message ?? e}`);
-					await sendText(openid, `⚠️ 图片没收到（${e?.message ?? e}），你可以改用文字描述，或重发一次。`, msgId).catch(() => {});
+					await sendText(openid, qqText('C75', { error: e?.message ?? e }), msgId).catch(() => {});
 					if (!text) return;
 				}
 			}
+			if (per.disconnected || (per.routingEpoch ?? 0) !== routingEpoch) return;
 			const sessionId = await ensureSession(per);
+			if (per.disconnected || (per.routingEpoch ?? 0) !== routingEpoch) { if (per.disconnected) per.sessionId = null; await saveState(); return; }
+			rememberSession(openid, sessionId);
 			const beforeTurn = await currentTurn(sessionId);
+			if (per.disconnected || (per.routingEpoch ?? 0) !== routingEpoch) return;
 			await submitPrompt(sessionId, text, imageParts);
 			ensureReplier(openid, sessionId, beforeTurn);
 		} catch (e) {
 			log(`提交失败: ${e?.message ?? e}`);
 			try {
-				await sendText(openid, `❌ ${e?.message ?? String(e)}`, msgId);
+				await sendText(openid, qqText('C76', { error: e?.message ?? String(e) }), msgId);
 			} catch {
 				/* ignore */
 			}
@@ -2523,17 +2866,31 @@ export function apply(ctx, config) {
 			log('缺少 QQ 凭证（appId/appSecret），请到设置页填写。');
 			return;
 		}
+		// 独占锁：同一份凭证只允许一个实例连 QQ。多实例（桌面 App 退出时留下的孤儿宿主）
+		// 会各持一条长连接，同一条私聊消息被回复 N 次——本机实测 3 次。
+		const claim = claimQqOwnership();
+		if (!claim.ok) {
+			log(`另一个 DSH 实例 (pid=${claim.owner}) 正在服务 QQ 桥接 → 本实例不连 QQ，避免重复回复；30 秒后重试接管。`);
+			if (BOT.lockTimer) clearTimeout(BOT.lockTimer);
+			BOT.lockTimer = setTimeout(() => {
+				BOT.lockTimer = null;
+				startBot();
+			}, 30000);
+			BOT.lockTimer.unref?.();
+			return;
+		}
 		BOT.running = true;
 		BOT.retry = 0;
 		BOT.msgSeq = Math.floor(Date.now() / 1000) % 1000000;
 		BOT.chains = new Map();
-		log(`启动：${cfg.sandbox ? '沙箱' : '正式'}环境`);
+		log(`启动：${cfg.sandbox ? '沙箱' : '正式'}环境（持有 QQ 独占锁 pid=${process.pid}）`);
 		connectLoop();
 	};
 	stopBot = () => {
 		if (!BOT.running) return;
 		BOT.running = false;
 		BOT.connected = false;
+		stopWsWatchdog();
 		for (const s of BOT.sockets) {
 			try {
 				s.close();
@@ -2549,6 +2906,10 @@ export function apply(ctx, config) {
 		if (BOT.retryTimer) {
 			clearTimeout(BOT.retryTimer);
 			BOT.retryTimer = null;
+		}
+		if (BOT.lockTimer) {
+			clearTimeout(BOT.lockTimer);
+			BOT.lockTimer = null;
 		}
 		BOT.ws = null;
 		log('已停止');
@@ -2604,6 +2965,22 @@ export function apply(ctx, config) {
 		}
 		registerInstance({ pid: process.pid, webPort, bridgePort: null, profile, cwd: process.cwd(), startedAt });
 		log(`已加载（v0.16.4, web:${webPort ?? '?'}）。到设置页 → 插件配置 → dsh-qq-bridge，填写凭证并打开"启用"。（设置页改动即自动保存，没有保存按钮）`);
+		ctx.inject(['connection'], (trusted) => {
+			for (const [path, method] of [['pending', 'GET'], ['ack', 'POST']]) {
+				const dispose = svc.webServer.register({ kind: 'exact', path: `/dsh-qq-bridge/interactive/${path}`, handler: async (req, res) => {
+					const rejection = trusted.connection.requestRejection(req);
+					if (rejection) return json(res, rejection, { ok: false, error: 'unauthorized' });
+					if (req.method !== method) return json(res, 405, { ok: false, error: 'method' });
+					if (method === 'GET') return json(res, 200, { ok: true, pending: state.interactive.pending.map(({ openid, ...entry }) => entry), commands: state.interactive.commands, recent: state.interactive.recent });
+					let body; try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, error: 'bad json' }); }
+					if (!body || typeof body.id !== 'string' || !['qq', 'desktop'].includes(body.source) || (body.summary !== undefined && typeof body.summary !== 'string')) return json(res, 400, { ok: false, error: 'bad payload' });
+					const entry = state.interactive.pending.find((p) => p.id === body.id);
+					finishInteraction(entry, body.source, String(body.summary ?? '').slice(0, 1500));
+					return json(res, 200, { ok: true, alreadySettled: !entry });
+				} });
+				trusted.on('dispose', dispose);
+			}
+		});
 		try {
 			svc.webServer.register({
 				kind: 'exact',
@@ -2671,6 +3048,36 @@ export function apply(ctx, config) {
 		} catch (e) {
 			log(`设置路由注册失败: ${e?.message ?? e}`);
 		}
+		// /会话 数据通路诊断出口（只读；回计数/耗时/降级来源，不回会话正文）
+		// GET /dsh-qq-bridge/sessions-diag
+		try {
+			svc.webServer.register({
+				kind: 'exact',
+				path: '/dsh-qq-bridge/sessions-diag',
+				handler: async (req, res) => {
+					if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method' });
+					let collected;
+					try {
+						collected = await collectSessionRows();
+					} catch (e) {
+						return json(res, 200, { ok: false, stage: 'collect', error: e?.message ?? String(e) });
+					}
+					return json(res, 200, {
+						ok: true,
+						source: collected.source,
+						queryError: collected.error,
+						ms: collected.ms,
+						records: collected.rows.length,
+						visible: collected.visible.length,
+						deletedIds: deletedSessionIds().size,
+						webPort: currentWebPort(),
+						perRow: collected.rows.map((row) => ({ shortId: shortIdFor(row.id), hasTitle: !!row.title, userMsgs: row.userMsgs, cwd: cwdLabel(row.cwd) })),
+					});
+				},
+			});
+		} catch (e) {
+			log(`诊断路由注册失败: ${e?.message ?? e}`);
+		}
 		// 审批 answerer：prepend+global → 瀑布最外层；QQ 会话由 QQ 用户 /approve /deny 决定
 		ctx.on('approval/request', approvalListener, { global: true, prepend: true });
 		// 用户问答 answerer：模型调 ask_user_question 时经 QQ 收集回答（/答 /跳过）
@@ -2688,11 +3095,17 @@ export function apply(ctx, config) {
 	ctx.inject(['agentPresets'], (presetCtx) => {
 		svc.agentPresets = presetCtx.agentPresets;
 	});
+	// 官方计划任务（@deepseek-ai/dsh-experimental-schedule-bundle）可选：/提醒 用它管理任务。
+	// 未启用时 /提醒 回 C77，桥接其余功能不受影响。
+	ctx.inject(['schedule'], (schedCtx) => {
+		svc.schedule = schedCtx.schedule;
+	});
 	// 0.1.7+：设置页保存会经 configEditor 落盘，Loader 随即 unload + 以新 config 重跑 apply，
 	// 所以「配置变更 → 启停/重启」的判定直接放在 apply 内完成（见下面 onSettingsApplied）。
 	onSettingsApplied();
 	ctx.on('dispose', async () => {
 		stopBot();
+		releaseQqOwnership();
 		unregisterInstance();
 		await saveState();
 	});}

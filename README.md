@@ -1,5 +1,12 @@
 # dsh-qq-bridge · QQ ↔ DSH 单插件桥接
 
+> **本插件的工作区布局**（规范见 [plugins/README.md](../README.md)）
+>
+> - `code/` 运行代码 ｜ `tests/` 测试代码 ｜ `docs/` 开发文档 ｜ `reference/` 参考资料
+> - `package.json` / `cordis.patch.yml` / `README.md` / `LICENSE` 是包契约文件，**必须留在本目录根**
+> - 状态：**休眠** ｜ 运行实体：`~/.dsh/profiles/desktop/plugins/dsh-qq-bridge/`
+> - 本目录是**备份 + 开发文档存放处**；在此改动**不会自动生效**，需同步到 profile 并重启实例
+
 > 在 QQ 里私聊机器人 = 坐在电脑前操作 DSH：接入任意历史会话、继续对话、只收到最终答复。
 > **单插件方案**：QQ 客户端（WSS 长连接 + 私聊）与 DSH 会话驱动全部收进一个 DSH 插件，
 > 无网关、无 HTTP 桥、无外部代码；配置从 DSH 设置页完成。
@@ -7,11 +14,37 @@
 > 本机 DSH 为 **Windows 原生安装**（`$env:DSH_HOME\profiles\web\`），QQ 长连接直接在
 > Windows 原生进程内运行，不经 WSL、无网络绕路。
 
+## 测试与重启后验收
+
+- 全套隔离测试（只读、不联网、不发 QQ）：`node tests/qq-bridge/run-all.mjs`；
+  也可指定安装副本：`node tests/qq-bridge/run-all.mjs ~/.dsh/profiles/desktop/plugins/dsh-qq-bridge`。
+  该入口固定了各测试的 argv 约定（例如 auto-save 只吃 `client.js`），避免手工传参把"通过"跑成"失败"。
+- 改动 Host 半（`lib/index.js`）后需要整实例重启才生效；重启入口与逐项验收见
+  [重启后验收.md](重启后验收.md)。
+
+## 长连接假活与自愈
+
+WebSocket 半开时（Mac 睡眠 / NAT 超时 / 代理断开 / 网关踢线）**不会触发 onclose/onerror**，
+于是 `BOT.connected` 一直是 true：设置页显示"已连接"、`qq_send` 还能发出消息，
+但 **QQ 发来的消息再也收不到**（表现就是"桥接完全断了"）。
+
+现在 `lib/index.js` 内置看门狗（`startWsWatchdog` / `WS_SILENCE_FACTOR`）：
+
+- 每半个心跳间隔巡检一次；`op11`（心跳 ACK）与任意帧都会刷新 `lastAckAt` / `lastFrameAt`；
+- 连续 **2.5 个心跳间隔**（下限 30s）没有任何帧 → 判定假活：置 `connected=false`、关闭当前 socket，
+  交给 `onclose` 重连；若 close 也没触发（极端半开）则 2s 后兜底排一次重连；
+- `stopBot` / 正常关闭时清理看门狗。
+
+手动应急（不用重启实例）：在设置页把「启用」关掉再打开；或命令行
+`POST /dsh-qq-bridge/settings {"enabled":false}` → 等 3s → `{"enabled":true}`，
+等于重建长连接；随后让对方发一条 QQ 消息确认入站恢复。
+
 ## 特性
 
 - **单插件、单进程**：QQ 官方机器人 API（WSS 长连接 + C2C 私聊）+ DSH 会话驱动全在插件内。
 - **设置页配置（改动即自动保存）**：`设置 → QQ 桥接` 填写 `appId / appSecret`、切换沙箱、打开「启用」开关即启动；开关点完立刻生效、文本框停止输入 0.7s 生效、密文框失焦生效——不需要点保存按钮。
 - **会话状态推送**：打开「QQ接受会话完成状态」后，任何主会话**跑完一轮**推 `[会话名]已完成`、**卡在等你选择/审批**推 `[会话名]在等你选择：…` / `[会话名]需要审批：…`（QQ 正在聊的那个会话不重复推，子会话不推）——人不在电脑前也知道任务跑完了、或卡在等你。
+- **计划任务交给官方插件**：创建用官方 `schedule_*` 工具（宿主级持久化），桥接只提供 `/提醒` 查看/取消，并把到点投递回原会话的那一轮结果转发回 QQ。
 - **只回最终文本**：从最终 `assistant/message` 的 `content` 里过滤 `type==='text'` 的块，reasoning / tool-call 不外泄。
 - **QQ 审批**：QQ 驱动的会话审批策略为 `'ask'`；需审批的操作（工具/原因/参数）会以 QQ 消息推送，回复 `/approve`（允许一次）或 `/deny`（拒绝）决定，超时自动拒绝；非 QQ 会话仍交给 Web UI answerer。
 - **会话可达**：`/会话` 列出全部持久化会话（`sessionQuery.listSessions()`，零 zstd 手写解码），短 ID 接入。
@@ -23,6 +56,8 @@
 - DSH 当前版本（0.1.5-rc.1 服务层：`sessionController` / `sessionQuery` / `sessions` / `approval` / `settings`）。
 - Node ≥ 22（全局 `fetch` / `WebSocket`）。
 - QQ 开放平台机器人：已开通 **C2C 单聊 + WSS 长连接** 事件；机器人的外网 IP 已加入平台白名单（或先用 **沙箱** 环境联调）。
+- 可选：官方计划任务 bundle `@deepseek-ai/dsh-experimental-schedule-bundle`（含 `time-context` / `schedule` / `ui-schedule`）。
+  启用后 `/提醒` 可用；未启用时 `/提醒` 回 C77，桥接其余功能不受影响。
 
 ## 部署（原生 Windows，重启生效）
 
@@ -155,31 +190,35 @@
   `工作区 <目录名>` → 会话短 ID。
 - 通知串行发送（不并发，避免触发 QQ 频控）；机器人未运行时直接丢弃、不排队。
 
-### 定时推送：`qq_schedule` 工具 + `/提醒` 命令
+### 计划任务：创建靠官方插件，桥接只管 `/提醒` 与结果转发
 
-模型侧有 `qq_schedule` 工具，QQ 侧有 `/提醒` 命令 —— 于是"以后每天 8 点提醒我喝水"这类要求可以真正落地。
-落盘在 `%DSH_HOME%\bridge\qq-schedule.json`，**跨实例重启保留**。
+"以后每天 8 点提醒我喝水"这类要求现在交给**官方计划任务插件**：启用官方 bundle
+`@deepseek-ai/dsh-experimental-schedule-bundle`（含 `time-context` / `schedule` / `ui-schedule` 三行）后，
+模型侧多出 `schedule_create` / `schedule_list` / `schedule_delete` / `schedule_update` 四个工具。
+创建必须给 `title`，以及**六个时间选择器之一**：`after_seconds` / `at` / `every_seconds` / `daily` / `weekly` / `cron`。
+任务由**宿主级持久化**（宿主重启后仍然有效），到点由官方把提醒作为一条 **user-role 消息投递回原会话**的 inbox
+（消息 `source.kind === 'schedule'`），该会话据此自己跑一轮 —— 桥接不再自己存任务、不再扫表。
+
+桥接在计划任务上只剩两件事：
 
 | 用法 | 说明 |
 |---|---|
-| `qq_schedule({ action: 'create', text: '喝水', inMinutes: 30 })` | N 分钟后推一次固定文本（一次性） |
-| `qq_schedule({ action: 'create', text: '该睡了', atTime: '23:30' })` | 每天 23:30 推（`repeat` 可 `daily` / `weekdays` / `once`，默认 `daily`） |
-| `qq_schedule({ action: 'create', prompt: '总结今天的待办', atTime: '08:00' })` | 到点**让 agent 干活**：默认在**一次性无头会话**里跑（落在创建任务的工作区并归组），答案由回复观察器推回 QQ |
-| `qq_schedule({ action: 'create', prompt: '…', session: 'current' })` | 同上，但回到**创建它的那个会话**里跑（需要那边的上下文时才用） |
-| `qq_schedule({ action: 'list' })` / `/提醒` | 列出任务（含下次触发时间、无头/当前会话标记） |
-| `qq_schedule({ action: 'cancel', id: 'a1b2' })` / `/提醒 删 a1b2` | 取消任务 |
+| `/提醒` | **直接列出官方计划任务目录**（与桌面端「计划任务」页同源，`ctx.schedule.catalog()`）：全部任务，含已停止；每行给出 ID、标题、规则、下次触发、所属会话，当前会话标 `←当前`。读不到目录时退回官方工具同款 `list({sessionId})`；两者都失败才回 C80 |
+| `/提醒 删 <ID>` | 用 `ctx.schedule.delete({ sessionId, id })` 取消；支持唯一前缀，前缀有歧义时拒绝（C79）；只有当该任务所在会话**正绑在别的 QQ 账号**上时才拒绝（C78） |
 
-**执行落点（prompt 任务）**：默认 `session: 'new'` —— 每次触发**新建一个一次性无头会话**，cwd 取
-**创建任务时所在会话的工作区**，并记账进 Workspace Registry（Web UI 里归到那个工作区）。这样任务
-**不依赖你的对话会话**（那份会话归档/删掉也不影响），代价是每次空白起步、会多一条会话记录。
-需要延续上下文时用 `session: 'current'`。配套：交付文件、审批、问答的收件人都回退到「本轮 run 的 openid」
-（`ownerOpenidForSession`），所以无头会话里 `present` 的文件、甚至需要审批的操作，都会找到你。
-
-- **触发方式**：插件内 20s 扫一次（`setInterval`），任务先排下一次/摘除再执行 —— 触发中崩了也不会重复刷。
-- **漏发补发**：实例当时没开 → 启动时补发一次；一次性任务过期超过 **24h** 就丢弃，免得开机刷出一堆过期提醒。
-- **上限与校验**：最多 50 个任务；`inMinutes` ≥ 1；文本 ≤ 2000 字；`text` 与 `prompt` 二选一；`atTime` 必须 `"HH:MM"`。
-- 前提：**到点那一刻实例在运行**（插件活在实例里）。要"实例关着也发"，得挂系统计划任务（本机沙箱里我建不了，见下）。
-- 定时推送同样是**主动消息**，吃 QQ 的主动消息频次。
+- **每轮结果回 QQ 的规则（与旁白/工具行完全一致）**：收件人按**当前绑定**（`openidForSession`）解析，
+  **每一轮结束时都会把该轮最终正文发回 QQ**，不区分这轮是从 QQ 还是从桌面端发起
+  （桌面端发起的轮次同样会推旁白/工具行，所以正文也必须跟过去，否则 QQ 只看到半截）。
+  QQ 发起的轮次仍由回复观察器负责（打字状态、超时补发、工具回放），此时桥接不重复发。
+- **计划任务投递可以回退**：投递那一轮（`source.kind === 'schedule'`）若当前绑定已切走，
+  允许按"用过的会话"（唯一候选）判定属主，保证自己任务的结果仍能回到 QQ。
+- **归属判定**：普通轮次看当前绑定；`/断开` 后不再转发；不属于任何 QQ 用户的会话只在桌面端显示。
+- **前置条件**：官方 schedule bundle 已启用。**未启用时 `/提醒` 回 C77**（"当前实例没有官方计划任务服务"），
+  桥接其余功能（会话 / 对话 / 审批 / 问答 / 文件）不受影响。
+- 桥接**不再写 `qq-schedule.json`**、不再注册 `qq_schedule` 工具、也没有 20 秒扫描调度器；
+  旧任务文件若还在，也不再被读取或调度。
+- 到点结果由桥接主动发回 QQ（没有被动回复的 `msg_id`），占用 QQ 的主动消息频次；
+  该用户 `/断开` 后不再收到转发。
 
 ### 收图：从 QQ 发图片给我
 
@@ -274,7 +313,7 @@ harness 的权限是**预设制**：一个预设 = `sandbox`（`read-only` / `wo
 | `deliverables/presented` | `📎 交付 3 个文件` + `· 末三段路径 — 说明` | 交付清单 `pushDeliverable`（最多 12 个） |
 | `tool/call` | `🔧 grep {"path": …}` | 工具调用 `pushToolCall`（参数截 120 字） |
 | `tool/call`（`todo_write` / `present`） | 不推 `🔧` 那行 | — 上面两条 `📋`/`📎` 已经说清楚了，不重复刷 JSON |
-| `assistant/message`（只有正文，没有工具调用） | 不单独推 | — 那是本轮最终正文，由回复观察器在轮末发一次，避免同一段话发两遍 |
+| `assistant/message`（只有正文，没有工具调用） | 不单独推 | — 那是本轮最终正文：会话属于 QQ 用户时在轮末统一发一次（QQ 发起的轮次由回复观察器发，桌面端/计划任务发起的轮次由轮末转发发），避免同一段话发两遍 |
 
 （消息按 0.6s 串行发送防频控；旁白/清单不进「本轮已执行的工具调用」清单，超时/中断回放时不会混进去。）
 
@@ -282,23 +321,59 @@ harness 的权限是**预设制**：一个预设 = `sandbox`（`read-only` / `wo
 
 | 输入 | 效果 |
 |---|---|
-| 普通消息 | 发给当前接入的会话；未接入则**自动新建会话**并返回结果 |
+| 普通消息 | 发给当前接入的会话；初次未接入时自动新建。使用 `/断开` 后不再自动新建，须先 `/会话 <ID>` 或 `/new` 接入 |
 | `/帮助` | 指令帮助 |
 | `/profile` | 查看运行中的 DSH 实例（本插件绑定当前实例） |
 | `/会话` | 列出会话（按工作区、创建时间倒序，标题/提问轮数/预设）；会话用 **4 位短 ID** |
-| `/会话 <4位ID>` | 接入某个会话，之后消息续聊该会话（ID 固定，跨重启不变） |
+| `/会话 <4位ID>` | 接入某个会话，之后消息续聊该会话（ID 固定，跨重启不变）；解除断开状态并恢复推送 |
+| `/断开` / `/disconnect` | 清空QQ当前绑定，仅停止实时对话正文/过程和问答审批推送；会话与任务留在桌面。**若“QQ接受会话完成状态”已打开，所有主会话完成通知仍发到QQ**，不要求当前QQ绑定会话。断开状态跨重启保存，已发送的QQ消息无法撤回 |
 | `/实例 <端口>` | 查看实例；跨实例对话请回 Web UI |
 | `/状态` | 全链路体检（插件/QQ 连接/实例/会话数） |
 | `/new` | 列出工作区 + 可用会话模式（序号/显示名/id）→ 回数字选工作区，新建会话并接入 |
 | `/new <工作区号> mode=<模式>` | 在该工作区新建**指定模式**的会话（模式写序号或 id，如 `mode=4` / `mode=cordis`；不填 = 默认模式） |
+| `/模型` | 先列供应商编号，再列所选供应商的模型编号；两步输入 `0` 都可取消 |
+| `/模型` 选择完成 | 只切换当前接入会话的模型，其他会话和全局默认不受影响 |
+| `/restart` | **强制重启尝试**：桌面版由分离 helper 结束 App 与宿主，再用 `open -n` 请求新实例并核验进程；如未自动出现需手动打开。非桌面只退出宿主。**会中断正在运行的任务** |
 | `/approve` | 允许当前会话的待审批请求（需审批操作会推送 `🔐` 详情） |
 | `/deny` | 拒绝待审批请求 |
 | `/跳过` | 跳过待回答的问题 |
-| `/提醒` | 列出定时推送任务（`/提醒 删 <ID>` 取消） |
+| `/提醒` | 列出计划任务（官方 schedule 插件；`/提醒 删 <ID>` 取消，支持唯一前缀） |
 | `/权限` | 查看当前会话权限；`/权限 <预设名>` 切换（如 `danger-full-access`）；`/权限 重置` 回默认 |
 
 等待期间 QQ 会显示「正在输入…」（`msg_type:6`，5 秒续发），不占消息配额。
 指令（`/` 开头）**立即处理**，不会被正在进行的对话串行阻塞（审批/问答/状态等可在对话中途响应）。
+
+### 单实例独占锁（防重复回复）
+
+QQ 凭证是账号级资源：**多个 DSH 宿主进程同时加载本插件时，每个进程都会连一条 QQ 长连接，
+同一条私聊消息就会被回复 N 次**（本机实测 3 次）。桌面 App 退出时宿主进程可能未被回收
+（PPID 变 1 的孤儿），多次开关 App 就会累积出多个"僵尸桥接"。
+
+- 插件在 `$DSH_HOME/bridge/qq-bridge.lock.json` 维护独占锁：**只有持锁实例连 QQ**。
+- 抢不到锁的实例不连 QQ，每 30 秒重试一次；持锁实例退出后自动接管（无需重启）。
+- `dispose` 时释放自己的锁；锁里的 pid 已死则视为可抢占。
+- registry 里的陈旧实例记录按 pid 存活情况自动清理（`/profile`、`/状态` 不再显示死进程）。
+- `/状态` 会列出存活实例数，>1 时给出 `⚠️ 多实例` 警告 —— 排查重复回复的第一入口。
+
+### 为什么 `/restart` 要绕过桌面 App 的确认框（重要）
+
+宿主进程的**任何**退出都会被桌面 App 判定为致命失败，弹出恢复框：
+`退出应用 / 重启 / 禁用第三方插件，备份 profile patch，并重启`（`DesktopFatalRecovery` → `showMessageBox`）。
+
+- App↔宿主 IPC 只有 `ready / platform-session / shutdown-complete / fatal`，**没有重启通道**；
+  打包版也没有重启菜单（`重启应用与 Host` 仅开发版），preload 的 IPC 通道同样没有。
+- ⚠️ **千万别点第三个按钮**：它会重写 profile 的 patch 层，第三方插件的 insert、各插件 config
+  （含本插件 `appId/appSecret`、`api-monitor` 的火山 AK/SK）、`agent-default-model` 等**一并丢失**。
+  本机已因此翻过一次车（可用 `cordis.patch.yml.bak-<ts>` 恢复）。
+- App 是 Developer ID 签名 + 公证，且 Electron fuse `EnableEmbeddedAsarIntegrityValidation` 为
+  **ENABLED** —— 改 `app.asar` 去掉弹框这条路不可行（会导致 App 拒绝启动）。
+- 桌面版 `/restart` 用分离的 `/bin/sh` helper 按 **App → 宿主** 顺序 SIGKILL，确认旧进程已退出后
+  用 `/usr/bin/open -n` 请求新实例。`open` 返回 0 **只代表 LaunchServices 接收了请求**，不等于启动成功；
+  helper 会观察新的 App 主进程，30 秒后仍未出现才有界重试一次，并在
+  `$DSH_HOME/bridge/qq-restart-trace.log` 记录 `first-check` / `restart-result`。若仍未自动出现，
+  需手动打开 App；若冷启动失败，先完全退出后在终端运行
+  `sh "$HOME/.dsh/recovery/restore-desktop-profile.sh"`。这是**强制结束**，运行中的任务会中断。
+- 退出前插件会主动 `stopBot` + `saveState` + 释放独占锁 + 注销 registry —— 因为 SIGKILL 不会执行 `dispose`。
 
 **会话模式**（= DSH 的 agent preset，与 Web UI 的「Agent 模式」同一份名单）：`/new` 的提示会列出
 「序号 + 显示名 + id」，序号与 Web UI 选择器一致（由各 preset 的 `order` 决定，自定义 preset 排在末尾），
@@ -355,3 +430,13 @@ harness 的权限是**预设制**：一个预设 = `sandbox`（`read-only` / `wo
   它丢弃了 `webServer.register` 的 disposer，且 `seenMsgIds` / `pendingApprovals` / `pendingQuestions` /
   `runs` 都是模块级活状态，重载会脑裂。**改完必须重启实例。**
 - **DSH 0.1.6-alpha.2：可用**。
+
+## 本机（macOS 桌面版）部署基线
+
+| 角色 | 路径 | 说明 |
+|---|---|---|
+| **生效副本（权威）** | `/Users/linan/.dsh/profiles/desktop/plugins/dsh-qq-bridge/` | 正在运行的 DSH 直接读这里；`node_modules/dsh-qq-bridge` 是指向它的符号链接 |
+| 工作区副本（仅备份） | `~/Nutstore Files/SyncFile/plugin/dsh-qq-bridge/`（本仓库） | 只作备份/版本留档，**不参与运行** |
+
+改代码的顺序：**先改安装目录（权威）→ 再镜像回工作区备份**；改完必须重启桌面 App 才生效
+（桌面宿主一次性读入模块，无热重载）。改前建议把旧文件备份到 `~/.dsh/plugin-backups/dsh-qq-bridge/`。
