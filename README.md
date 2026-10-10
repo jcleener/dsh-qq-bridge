@@ -20,7 +20,7 @@
   也可指定安装副本：`node tests/qq-bridge/run-all.mjs ~/.dsh/profiles/desktop/plugins/dsh-qq-bridge`。
   该入口固定了各测试的 argv 约定（例如 auto-save 只吃 `client.js`），避免手工传参把"通过"跑成"失败"。
 - 改动 Host 半（`lib/index.js`）后需要整实例重启才生效；重启入口与逐项验收见
-  [重启后验收.md](重启后验收.md)。
+  [重启后验收.md](docs/重启后验收.md)。
 
 ## 长连接假活与自愈
 
